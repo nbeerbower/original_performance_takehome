@@ -41,19 +41,17 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vconst_map = {}  # For vector constants
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
-
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
+
+    def add_bundle(self, bundle: dict):
+        """Add a pre-formed instruction bundle (for VLIW packing)"""
+        self.instrs.append(bundle)
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -71,28 +69,29 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
+    def scratch_vconst(self, val, name=None):
+        """Allocate a vector constant (broadcast scalar to VLEN elements)"""
+        if val not in self.vconst_map:
+            scalar_addr = self.scratch_const(val)
+            addr = self.alloc_scratch(name, VLEN)
+            self.add("valu", ("vbroadcast", addr, scalar_addr))
+            self.vconst_map[val] = addr
+        return self.vconst_map[val]
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Optimized kernel with:
+        1. Vectorization (VLEN=8) - process 8 elements per operation
+        2. VLIW packing - multiple operations per cycle
+        3. Hardware loop for rounds, fully unrolled batch
+        4. Parallel hash stages - exploit ALU parallelism
+        5. UNROLL=8 - process 64 elements per batch iteration (4 iterations total)
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        UNROLL = 16  # Process 16 vector chunks per iteration
+
+        # Load memory layout from header
         init_vars = [
             "rounds",
             "n_nodes",
@@ -104,70 +103,225 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Efficient header loading
+        addr_temps = [self.alloc_scratch() for _ in range(2)]
+        for i in range(0, len(init_vars), 2):
+            bundle = {"load": []}
+            for j in range(min(2, len(init_vars) - i)):
+                bundle["load"].append(("const", addr_temps[j], i + j))
+            self.add_bundle(bundle)
+            bundle = {"load": []}
+            for j in range(min(2, len(init_vars) - i)):
+                bundle["load"].append(("load", self.scratch[init_vars[i + j]], addr_temps[j]))
+            self.add_bundle(bundle)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        # Scalar constants
+        zero_const = self.scratch_const(0, "zero")
+        one_const = self.scratch_const(1, "one")
+        two_const = self.scratch_const(2, "two")
+        vlen_const = self.scratch_const(VLEN, "vlen")
+        stride_const = self.scratch_const(VLEN * UNROLL, "stride")
+        n_vec_iters = batch_size // (VLEN * UNROLL)  # 256 // 32 = 8
+        n_vec_iters_const = self.scratch_const(n_vec_iters, "n_vec_iters")
+
+        # Vector constants
+        v_zero = self.scratch_vconst(0, "v_zero")
+        v_one = self.scratch_vconst(1, "v_one")
+        v_two = self.scratch_vconst(2, "v_two")
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+
+        # Hash constants (vectorized)
+        hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.scratch_vconst(val1, f"hash_{hi}_c1")
+            c3 = self.scratch_vconst(val3, f"hash_{hi}_c3")
+            hash_consts.append((c1, c3))
+
+        # Vector scratch registers for UNROLL lanes
+        # Note: v_tmp3 removed - no longer needed since we use arithmetic instead of vselect
+        v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
+        v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
+        v_node_val = [self.alloc_scratch(f"v_node_val_{u}", VLEN) for u in range(UNROLL)]
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{u}", VLEN) for u in range(UNROLL)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
+        v_addr = [self.alloc_scratch(f"v_addr_{u}", VLEN) for u in range(UNROLL)]
+
+        # Scalar base addresses for each unroll lane
+        idx_base = [self.alloc_scratch(f"idx_base_{u}") for u in range(UNROLL)]
+        val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
+
+        # Loop counters
+        round_counter = self.alloc_scratch("round_counter")
+        batch_counter = self.alloc_scratch("batch_counter")
+        loop_cond = self.alloc_scratch("loop_cond")
+
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        # Pre-broadcast constants
+        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Initialize round counter
+        self.add("load", ("const", round_counter, 0))
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        round_loop_start = len(self.instrs)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+        # Initialize batch counter
+        self.add("load", ("const", batch_counter, 0))
+
+        # Compute base addresses for all unroll lanes
+        # idx_base[0] = inp_indices_p, idx_base[1] = inp_indices_p + VLEN, etc.
+        self.add_bundle({
+            "alu": [
+                ("+", idx_base[0], self.scratch["inp_indices_p"], zero_const),
+                ("+", val_base[0], self.scratch["inp_values_p"], zero_const),
+            ]
+        })
+        for u in range(1, UNROLL):
+            self.add_bundle({
+                "alu": [
+                    ("+", idx_base[u], idx_base[u-1], vlen_const),
+                    ("+", val_base[u], val_base[u-1], vlen_const),
+                ]
+            })
+
+        batch_loop_start = len(self.instrs)
+
+        # === LOAD PHASE: Load idx and val, compute addresses ===
+        # Interleave vloads with address computation for better pipelining
+        # Load idx vectors in pairs
+        for u in range(0, UNROLL, 2):
+            if u == 0:
+                self.add_bundle({"load": [
+                    ("vload", v_idx[u], idx_base[u]),
+                    ("vload", v_idx[u+1], idx_base[u+1]),
+                ]})
+            elif u >= 2:
+                # Overlap with address computation for previous pair
+                self.add_bundle({
+                    "load": [
+                        ("vload", v_idx[u], idx_base[u]),
+                        ("vload", v_idx[u+1], idx_base[u+1]),
+                    ],
+                    "valu": [
+                        ("+", v_addr[u-2], v_forest_p, v_idx[u-2]),
+                        ("+", v_addr[u-1], v_forest_p, v_idx[u-1]),
+                    ]
+                })
+
+        # Load val vectors with address computation overlap
+        for u in range(0, UNROLL, 2):
+            bundle = {"load": [
+                ("vload", v_val[u], val_base[u]),
+                ("vload", v_val[u+1], val_base[u+1]),
+            ]}
+            # Overlap with address computation if there are remaining indices
+            valu_ops = []
+            if u + 2 < UNROLL:
+                valu_ops.append(("+", v_addr[u+2], v_forest_p, v_idx[u+2]))
+            if u + 3 < UNROLL:
+                valu_ops.append(("+", v_addr[u+3], v_forest_p, v_idx[u+3]))
+            if valu_ops:
+                bundle["valu"] = valu_ops
+            self.add_bundle(bundle)
+
+        # Compute final addresses if not done in loop above
+        final_addrs = []
+        for i in range(UNROLL - 2, UNROLL):
+            if i >= (UNROLL // 2) * 2 + 2:  # These weren't computed in the loop
+                final_addrs.append(("+", v_addr[i], v_forest_p, v_idx[i]))
+        if final_addrs:
+            self.add_bundle({"valu": final_addrs})
+
+        # === GATHER PHASE: Load node values (8 loads per unroll lane) ===
+        for i in range(0, VLEN, 2):
+            for u in range(UNROLL):
+                self.add_bundle({"load": [
+                    ("load_offset", v_node_val[u], v_addr[u], i),
+                    ("load_offset", v_node_val[u], v_addr[u], i + 1),
+                ]})
+
+        # === COMPUTE PHASE: XOR all lanes (pack up to 6 per cycle) ===
+        for u in range(0, UNROLL, 6):
+            ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, min(u+6, UNROLL))]
+            self.add_bundle({"valu": ops})
+
+        # === HASH PHASE ===
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1, c3 = hash_consts[hi]
+            # Compute tmp1 and tmp2: 2 ops per lane, 6 VALU slots max
+            for u in range(0, UNROLL, 3):
+                ops = []
+                for i in range(u, min(u+3, UNROLL)):
+                    ops.append((op1, v_tmp1[i], v_val[i], c1))
+                    ops.append((op3, v_tmp2[i], v_val[i], c3))
+                self.add_bundle({"valu": ops})
+            # Combine: 1 op per lane
+            for u in range(0, UNROLL, 6):
+                ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(u, min(u+6, UNROLL))]
+                self.add_bundle({"valu": ops})
+
+        # === INDEX UPDATE PHASE ===
+        # tmp1 = val & 1, idx = idx * 2 (2 ops per lane, 6 slots max)
+        for u in range(0, UNROLL, 3):
+            ops = []
+            for i in range(u, min(u+3, UNROLL)):
+                ops.append(("&", v_tmp1[i], v_val[i], v_one))
+                ops.append(("*", v_idx[i], v_idx[i], v_two))
+            self.add_bundle({"valu": ops})
+
+        # tmp1 = tmp1 + 1
+        for u in range(0, UNROLL, 6):
+            ops = [("+", v_tmp1[i], v_tmp1[i], v_one) for i in range(u, min(u+6, UNROLL))]
+            self.add_bundle({"valu": ops})
+
+        # idx = idx + tmp1
+        for u in range(0, UNROLL, 6):
+            ops = [("+", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(u, min(u+6, UNROLL))]
+            self.add_bundle({"valu": ops})
+
+        # tmp1 = (idx < n_nodes)
+        for u in range(0, UNROLL, 6):
+            ops = [("<", v_tmp1[i], v_idx[i], v_n_nodes) for i in range(u, min(u+6, UNROLL))]
+            self.add_bundle({"valu": ops})
+
+        # idx = idx * tmp1
+        for u in range(0, UNROLL, 6):
+            ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(u, min(u+6, UNROLL))]
+            self.add_bundle({"valu": ops})
+
+        # === STORE PHASE ===
+        for u in range(0, UNROLL, 2):
+            self.add_bundle({"store": [
+                ("vstore", idx_base[u], v_idx[u]),
+                ("vstore", idx_base[u+1], v_idx[u+1]),
+            ]})
+        for u in range(0, UNROLL, 2):
+            self.add_bundle({"store": [
+                ("vstore", val_base[u], v_val[u]),
+                ("vstore", val_base[u+1], v_val[u+1]),
+            ]})
+
+        # Advance pointers (pack with stores where possible)
+        for u in range(0, UNROLL, 4):
+            ops = []
+            for i in range(u, min(u+4, UNROLL)):
+                ops.append(("+", idx_base[i], idx_base[i], stride_const))
+                ops.append(("+", val_base[i], val_base[i], stride_const))
+            self.add_bundle({"alu": ops})
+
+        # Loop control
+        self.add("flow", ("add_imm", batch_counter, batch_counter, 1))
+        self.add("alu", ("<", loop_cond, batch_counter, n_vec_iters_const))
+        self.add("flow", ("cond_jump", loop_cond, batch_loop_start))
+
+        # Round loop control
+        self.add("flow", ("add_imm", round_counter, round_counter, 1))
+        self.add("alu", ("<", loop_cond, round_counter, self.scratch["rounds"]))
+        self.add("flow", ("cond_jump", loop_cond, round_loop_start))
+
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
