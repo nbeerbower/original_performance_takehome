@@ -235,9 +235,9 @@ class KernelBuilder:
         if final_addrs:
             self.add_bundle({"valu": final_addrs})
 
-        # === PIPELINED GATHER + COMPUTE ===
-        # Process in chunks of 4 lanes: gather chunk N, then XOR+hash chunk N while gathering chunk N+1
-        CHUNK = 4
+        # === PIPELINED GATHER + COMPUTE (CHUNK=4) ===
+        # Process in chunks: gather chunk N, then XOR+hash chunk N while gathering chunk N+1
+        CHUNK = 4  # Optimal chunk size
 
         # Gather first chunk (no overlap possible yet)
         for i in range(0, VLEN, 2):
@@ -252,121 +252,89 @@ class KernelBuilder:
             chunk_end = min(chunk_start + CHUNK, UNROLL)
             prev_start = chunk_start - CHUNK
             prev_end = chunk_start
+            chunk_size = prev_end - prev_start
 
-            # === Overlap: Gather chunk_start..chunk_end with XOR+hash for prev_start..prev_end ===
-
-            # XOR previous chunk (pack all 4 in one cycle)
-            xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(prev_start, prev_end)]
-            self.add_bundle({"valu": xor_ops})
+            # XOR previous chunk (pack 6 lanes max per cycle)
+            for u in range(prev_start, prev_end, 6):
+                xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, min(u+6, prev_end))]
+                self.add_bundle({"valu": xor_ops})
 
             # Hash previous chunk while gathering current chunk
-            # Pack 6 VALU ops per cycle (3 lanes × 2 ops) with 2 loads
             gather_idx = 0
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 c1, c3 = hash_consts[hi]
-                # Stage 1: compute tmp1 and tmp2 for all 4 lanes
-                # Use 6 ops per cycle (3 lanes) + remaining 1 lane in next cycle
-                hash_ops_1 = [
-                    (op1, v_tmp1[prev_start], v_val[prev_start], c1),
-                    (op3, v_tmp2[prev_start], v_val[prev_start], c3),
-                    (op1, v_tmp1[prev_start+1], v_val[prev_start+1], c1),
-                    (op3, v_tmp2[prev_start+1], v_val[prev_start+1], c3),
-                    (op1, v_tmp1[prev_start+2], v_val[prev_start+2], c1),
-                    (op3, v_tmp2[prev_start+2], v_val[prev_start+2], c3),
-                ]
-                # Overlap with gather
-                if gather_idx < VLEN * CHUNK:
-                    lane = gather_idx // VLEN
-                    offset = (gather_idx % VLEN)
-                    if lane < chunk_end - chunk_start and offset < VLEN - 1:
-                        self.add_bundle({
-                            "valu": hash_ops_1,
-                            "load": [
-                                ("load_offset", v_node_val[chunk_start + lane], v_addr[chunk_start + lane], offset),
-                                ("load_offset", v_node_val[chunk_start + lane], v_addr[chunk_start + lane], offset + 1),
-                            ]
-                        })
-                        gather_idx += 2
+                # Compute tmp1 and tmp2: 3 lanes per cycle (6 ops)
+                for u in range(prev_start, prev_end, 3):
+                    hash_ops = []
+                    for i in range(u, min(u+3, prev_end)):
+                        hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
+                        hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
+                    # Overlap with gather
+                    if gather_idx < VLEN * (chunk_end - chunk_start):
+                        lane = chunk_start + gather_idx // VLEN
+                        offset = gather_idx % VLEN
+                        if lane < chunk_end and offset < VLEN - 1:
+                            self.add_bundle({
+                                "valu": hash_ops,
+                                "load": [
+                                    ("load_offset", v_node_val[lane], v_addr[lane], offset),
+                                    ("load_offset", v_node_val[lane], v_addr[lane], offset + 1),
+                                ]
+                            })
+                            gather_idx += 2
+                        else:
+                            self.add_bundle({"valu": hash_ops})
                     else:
-                        self.add_bundle({"valu": hash_ops_1})
-                else:
-                    self.add_bundle({"valu": hash_ops_1})
+                        self.add_bundle({"valu": hash_ops})
 
-                # Last lane + combine first 3 lanes in one cycle
-                hash_ops_2 = [
-                    (op1, v_tmp1[prev_start+3], v_val[prev_start+3], c1),
-                    (op3, v_tmp2[prev_start+3], v_val[prev_start+3], c3),
-                    (op2, v_val[prev_start], v_tmp1[prev_start], v_tmp2[prev_start]),
-                    (op2, v_val[prev_start+1], v_tmp1[prev_start+1], v_tmp2[prev_start+1]),
-                ]
-                if gather_idx < VLEN * CHUNK:
-                    lane = gather_idx // VLEN
-                    offset = (gather_idx % VLEN)
-                    if lane < chunk_end - chunk_start and offset < VLEN - 1:
-                        self.add_bundle({
-                            "valu": hash_ops_2,
-                            "load": [
-                                ("load_offset", v_node_val[chunk_start + lane], v_addr[chunk_start + lane], offset),
-                                ("load_offset", v_node_val[chunk_start + lane], v_addr[chunk_start + lane], offset + 1),
-                            ]
-                        })
-                        gather_idx += 2
-                    else:
-                        self.add_bundle({"valu": hash_ops_2})
-                else:
-                    self.add_bundle({"valu": hash_ops_2})
-
-                # Combine remaining 2 lanes
-                combine_ops = [
-                    (op2, v_val[prev_start+2], v_tmp1[prev_start+2], v_tmp2[prev_start+2]),
-                    (op2, v_val[prev_start+3], v_tmp1[prev_start+3], v_tmp2[prev_start+3]),
-                ]
-                if gather_idx < VLEN * CHUNK:
-                    lane = gather_idx // VLEN
-                    offset = (gather_idx % VLEN)
-                    if lane < chunk_end - chunk_start and offset < VLEN - 1:
-                        self.add_bundle({
-                            "valu": combine_ops,
-                            "load": [
-                                ("load_offset", v_node_val[chunk_start + lane], v_addr[chunk_start + lane], offset),
-                                ("load_offset", v_node_val[chunk_start + lane], v_addr[chunk_start + lane], offset + 1),
-                            ]
-                        })
-                        gather_idx += 2
+                # Combine: 6 lanes per cycle
+                for u in range(prev_start, prev_end, 6):
+                    combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(u, min(u+6, prev_end))]
+                    if gather_idx < VLEN * (chunk_end - chunk_start):
+                        lane = chunk_start + gather_idx // VLEN
+                        offset = gather_idx % VLEN
+                        if lane < chunk_end and offset < VLEN - 1:
+                            self.add_bundle({
+                                "valu": combine_ops,
+                                "load": [
+                                    ("load_offset", v_node_val[lane], v_addr[lane], offset),
+                                    ("load_offset", v_node_val[lane], v_addr[lane], offset + 1),
+                                ]
+                            })
+                            gather_idx += 2
+                        else:
+                            self.add_bundle({"valu": combine_ops})
                     else:
                         self.add_bundle({"valu": combine_ops})
-                else:
-                    self.add_bundle({"valu": combine_ops})
 
-            # Finish any remaining gather for current chunk
+            # Finish any remaining gather
             while gather_idx < VLEN * (chunk_end - chunk_start):
-                offset_in_chunk = gather_idx // 2
-                lane_in_chunk = offset_in_chunk // 4
-                elem_offset = (offset_in_chunk % 4) * 2
-                if lane_in_chunk < chunk_end - chunk_start:
+                lane = chunk_start + gather_idx // VLEN
+                offset = gather_idx % VLEN
+                if lane < chunk_end and offset < VLEN - 1:
                     self.add_bundle({"load": [
-                        ("load_offset", v_node_val[chunk_start + lane_in_chunk], v_addr[chunk_start + lane_in_chunk], elem_offset),
-                        ("load_offset", v_node_val[chunk_start + lane_in_chunk], v_addr[chunk_start + lane_in_chunk], elem_offset + 1),
+                        ("load_offset", v_node_val[lane], v_addr[lane], offset),
+                        ("load_offset", v_node_val[lane], v_addr[lane], offset + 1),
                     ]})
                 gather_idx += 2
 
         # XOR and hash last chunk (no more gather to overlap)
         last_start = UNROLL - CHUNK
-        xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(last_start, UNROLL)]
-        self.add_bundle({"valu": xor_ops})
+        for u in range(last_start, UNROLL, 6):
+            xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, min(u+6, UNROLL))]
+            self.add_bundle({"valu": xor_ops})
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1, c3 = hash_consts[hi]
-            for u in range(last_start, UNROLL, 2):
-                ops = [
-                    (op1, v_tmp1[u], v_val[u], c1),
-                    (op3, v_tmp2[u], v_val[u], c3),
-                    (op1, v_tmp1[u+1], v_val[u+1], c1),
-                    (op3, v_tmp2[u+1], v_val[u+1], c3),
-                ]
+            for u in range(last_start, UNROLL, 3):
+                ops = []
+                for i in range(u, min(u+3, UNROLL)):
+                    ops.append((op1, v_tmp1[i], v_val[i], c1))
+                    ops.append((op3, v_tmp2[i], v_val[i], c3))
                 self.add_bundle({"valu": ops})
-            ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(last_start, UNROLL)]
-            self.add_bundle({"valu": ops})
+            for u in range(last_start, UNROLL, 6):
+                ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(u, min(u+6, UNROLL))]
+                self.add_bundle({"valu": ops})
 
         # === INDEX UPDATE PHASE ===
         # tmp1 = val & 1, idx = idx * 2 (2 ops per lane, 6 slots max)
