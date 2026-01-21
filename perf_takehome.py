@@ -237,7 +237,7 @@ class KernelBuilder:
 
         # === PIPELINED GATHER + COMPUTE (CHUNK=4) ===
         # Process in chunks: gather chunk N, then XOR+hash chunk N while gathering chunk N+1
-        CHUNK = 4  # Optimal chunk size
+        CHUNK = 4  # Optimal chunk size (tested: 4 > 2 > 8)
 
         # Gather first chunk (no overlap possible yet)
         for i in range(0, VLEN, 2):
@@ -360,30 +360,50 @@ class KernelBuilder:
             ops = [("<", v_tmp1[i], v_idx[i], v_n_nodes) for i in range(u, min(u+6, UNROLL))]
             self.add_bundle({"valu": ops})
 
-        # idx = idx * tmp1
-        for u in range(0, UNROLL, 6):
-            ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
+        # idx = idx * tmp1, OVERLAPPED with first idx stores
+        # After computing idx[0..5], we can start storing them while computing idx[6..15]
+        # Cycle 1: compute idx[0..5]
+        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(0, 6)]
+        self.add_bundle({"valu": ops})
+        # Cycle 2: compute idx[6..11], store idx[0..1]
+        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(6, 12)]
+        self.add_bundle({"valu": ops, "store": [
+            ("vstore", idx_base[0], v_idx[0]),
+            ("vstore", idx_base[1], v_idx[1]),
+        ]})
+        # Cycle 3: compute idx[12..15], store idx[2..3]
+        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(12, min(16, UNROLL))]
+        self.add_bundle({"valu": ops, "store": [
+            ("vstore", idx_base[2], v_idx[2]),
+            ("vstore", idx_base[3], v_idx[3]),
+        ]})
 
-        # === STORE PHASE ===
-        for u in range(0, UNROLL, 2):
+        # === STORE PHASE with POINTER UPDATES OVERLAPPED ===
+        # Store remaining idx, then store val with pointer updates overlapped
+        # Must update pointers AFTER the corresponding val store uses them
+        for u in range(4, UNROLL, 2):  # Start from 4, first 4 already stored
             self.add_bundle({"store": [
                 ("vstore", idx_base[u], v_idx[u]),
                 ("vstore", idx_base[u+1], v_idx[u+1]),
             ]})
+        # Store val vectors and overlap pointer updates (safe: writes happen at end of cycle)
         for u in range(0, UNROLL, 2):
-            self.add_bundle({"store": [
+            bundle = {"store": [
                 ("vstore", val_base[u], v_val[u]),
                 ("vstore", val_base[u+1], v_val[u+1]),
-            ]})
-
-        # Advance pointers (pack with stores where possible)
-        for u in range(0, UNROLL, 4):
-            ops = []
-            for i in range(u, min(u+4, UNROLL)):
-                ops.append(("+", idx_base[i], idx_base[i], stride_const))
-                ops.append(("+", val_base[i], val_base[i], stride_const))
-            self.add_bundle({"alu": ops})
+            ]}
+            # Update the pointers we just used (u and u+1) plus more to fill ALU slots
+            # Update 4 pointers per cycle (8 ALU ops: 4 idx + 4 val updates)
+            if u < UNROLL:
+                alu_ops = []
+                # Update pointers for indices u, u+1 (already used) plus u+2, u+3 (will use next cycle)
+                # But we need to only update what's been used. Simpler: just update current pair
+                alu_ops.append(("+", idx_base[u], idx_base[u], stride_const))
+                alu_ops.append(("+", idx_base[u+1], idx_base[u+1], stride_const))
+                alu_ops.append(("+", val_base[u], val_base[u], stride_const))
+                alu_ops.append(("+", val_base[u+1], val_base[u+1], stride_const))
+                bundle["alu"] = alu_ops
+            self.add_bundle(bundle)
 
         # Loop control
         self.add("flow", ("add_imm", batch_counter, batch_counter, 1))
