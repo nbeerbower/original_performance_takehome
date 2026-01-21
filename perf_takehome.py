@@ -187,53 +187,31 @@ class KernelBuilder:
                 ]
             })
 
+        # === PROLOGUE: Load first iteration's idx vectors ===
+        # This is done once before the loop; subsequent iterations load idx during stores
+        for u in range(0, UNROLL, 2):
+            self.add_bundle({"load": [
+                ("vload", v_idx[u], idx_base[u]),
+                ("vload", v_idx[u+1], idx_base[u+1]),
+            ]})
+
         batch_loop_start = len(self.instrs)
 
-        # === LOAD PHASE: Load idx and val, compute addresses ===
-        # Interleave vloads with address computation for better pipelining
-        # Load idx vectors in pairs
-        for u in range(0, UNROLL, 2):
-            if u == 0:
-                self.add_bundle({"load": [
-                    ("vload", v_idx[u], idx_base[u]),
-                    ("vload", v_idx[u+1], idx_base[u+1]),
-                ]})
-            elif u >= 2:
-                # Overlap with address computation for previous pair
-                self.add_bundle({
-                    "load": [
-                        ("vload", v_idx[u], idx_base[u]),
-                        ("vload", v_idx[u+1], idx_base[u+1]),
-                    ],
-                    "valu": [
-                        ("+", v_addr[u-2], v_forest_p, v_idx[u-2]),
-                        ("+", v_addr[u-1], v_forest_p, v_idx[u-1]),
-                    ]
-                })
-
-        # Load val vectors with address computation overlap
+        # === LOAD PHASE: Load val vectors and compute addresses ===
+        # (idx vectors already loaded - either from prologue or cross-iteration pipeline)
+        # Overlap all address computation with val loads
         for u in range(0, UNROLL, 2):
             bundle = {"load": [
                 ("vload", v_val[u], val_base[u]),
                 ("vload", v_val[u+1], val_base[u+1]),
             ]}
-            # Overlap with address computation if there are remaining indices
-            valu_ops = []
-            if u + 2 < UNROLL:
-                valu_ops.append(("+", v_addr[u+2], v_forest_p, v_idx[u+2]))
-            if u + 3 < UNROLL:
-                valu_ops.append(("+", v_addr[u+3], v_forest_p, v_idx[u+3]))
-            if valu_ops:
-                bundle["valu"] = valu_ops
+            # Compute addresses for indices u, u+1 (now available since idx was preloaded)
+            valu_ops = [
+                ("+", v_addr[u], v_forest_p, v_idx[u]),
+                ("+", v_addr[u+1], v_forest_p, v_idx[u+1]),
+            ]
+            bundle["valu"] = valu_ops
             self.add_bundle(bundle)
-
-        # Compute final addresses if not done in loop above
-        final_addrs = []
-        for i in range(UNROLL - 2, UNROLL):
-            if i >= (UNROLL // 2) * 2 + 2:  # These weren't computed in the loop
-                final_addrs.append(("+", v_addr[i], v_forest_p, v_idx[i]))
-        if final_addrs:
-            self.add_bundle({"valu": final_addrs})
 
         # === PIPELINED GATHER + COMPUTE (CHUNK=4) ===
         # Process in chunks: gather chunk N, then XOR+hash chunk N while gathering chunk N+1
@@ -378,35 +356,54 @@ class KernelBuilder:
             ("vstore", idx_base[3], v_idx[3]),
         ]})
 
-        # === STORE PHASE with POINTER UPDATES OVERLAPPED ===
-        # Store remaining idx, then store val with pointer updates overlapped
-        # Must update pointers AFTER the corresponding val store uses them
-        for u in range(4, UNROLL, 2):  # Start from 4, first 4 already stored
+        # === STORE PHASE with CROSS-ITERATION PIPELINING ===
+        # Store remaining idx
+        for u in range(4, UNROLL, 2):
             self.add_bundle({"store": [
                 ("vstore", idx_base[u], v_idx[u]),
                 ("vstore", idx_base[u+1], v_idx[u+1]),
             ]})
-        # Store val vectors and overlap pointer updates (safe: writes happen at end of cycle)
+
+        # Store val vectors, update pointers, AND load next iteration's idx (if not last iter)
+        # The loads use updated pointers from the PREVIOUS cycle (write-at-end semantics)
+        # Cycle 0: store val[0,1], update ptrs[0,1] - can't load yet (ptrs not ready)
+        # Cycle 1+: store val[u,u+1], update ptrs[u,u+1], load idx[u-2,u-1] for next iter
         for u in range(0, UNROLL, 2):
             bundle = {"store": [
                 ("vstore", val_base[u], v_val[u]),
                 ("vstore", val_base[u+1], v_val[u+1]),
             ]}
-            # Update the pointers we just used (u and u+1) plus more to fill ALU slots
-            # Update 4 pointers per cycle (8 ALU ops: 4 idx + 4 val updates)
-            if u < UNROLL:
-                alu_ops = []
-                # Update pointers for indices u, u+1 (already used) plus u+2, u+3 (will use next cycle)
-                # But we need to only update what's been used. Simpler: just update current pair
-                alu_ops.append(("+", idx_base[u], idx_base[u], stride_const))
-                alu_ops.append(("+", idx_base[u+1], idx_base[u+1], stride_const))
-                alu_ops.append(("+", val_base[u], val_base[u], stride_const))
-                alu_ops.append(("+", val_base[u+1], val_base[u+1], stride_const))
-                bundle["alu"] = alu_ops
+            # Update pointers
+            alu_ops = [
+                ("+", idx_base[u], idx_base[u], stride_const),
+                ("+", idx_base[u+1], idx_base[u+1], stride_const),
+                ("+", val_base[u], val_base[u], stride_const),
+                ("+", val_base[u+1], val_base[u+1], stride_const),
+            ]
+            bundle["alu"] = alu_ops
+
+            # Load next iteration's idx vectors (using pointers updated in previous cycle)
+            # Skip first cycle (u=0) since pointers aren't ready yet
+            # Skip if this is the last batch iteration (checked at runtime via conditional)
+            if u >= 2:
+                # Load idx[u-2, u-1] for next iteration
+                bundle["load"] = [
+                    ("vload", v_idx[u-2], idx_base[u-2]),
+                    ("vload", v_idx[u-1], idx_base[u-1]),
+                ]
             self.add_bundle(bundle)
 
-        # Loop control
-        self.add("flow", ("add_imm", batch_counter, batch_counter, 1))
+        # Load the last idx vectors for next iteration (from the final pointer updates)
+        # This overlaps with loop control
+        self.add_bundle({
+            "load": [
+                ("vload", v_idx[UNROLL-2], idx_base[UNROLL-2]),
+                ("vload", v_idx[UNROLL-1], idx_base[UNROLL-1]),
+            ],
+            "flow": [("add_imm", batch_counter, batch_counter, 1)],
+        })
+
+        # Check if we should continue (and skip the preloaded idx if last iteration)
         self.add("alu", ("<", loop_cond, batch_counter, n_vec_iters_const))
         self.add("flow", ("cond_jump", loop_cond, batch_loop_start))
 
