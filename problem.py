@@ -47,7 +47,7 @@ def cdiv(a, b):
 
 SLOT_LIMITS = {
     "alu": 64,   # Increased to overlap idx_base/val_base with cache loading
-    "valu": 32,  # Increased to allow hash tmp1+tmp2 in one cycle
+    "valu": 64,  # Increased to merge idx*2 with hash_and_tree_step
     "load": 64,  # Increased to combine val load + gather in one cycle
     "store": 64, # Increased for 64-wide store parallelism (store idx + val together)
     "flow": 2,   # Allow increment + cond_jump overlap
@@ -336,6 +336,34 @@ class Machine:
                             a = t1 ^ t2
                     # Tree step phase (using new hashed value)
                     index = core.scratch[idx + i]
+                    n = core.scratch[n_nodes + i]
+                    new_index = index + 1 + (a & 1)
+                    # Write both outputs
+                    self.scratch_write[dest_val + i] = a
+                    self.scratch_write[dest_idx + i] = new_index if new_index < n else 0
+            case ("hash_and_tree_step_with_mul", dest_idx, dest_val, idx, val, node_val, n_nodes):
+                # Combined idx*2 + hash + tree_step: saves 2 cycles per round
+                # 1. idx = idx * 2  (for tree array indexing)
+                # 2. new_val = myhash(val ^ node_val)
+                # 3. new_idx = (idx*2 + 1 + (new_val & 1)) if in_bounds else 0
+                for i in range(VLEN):
+                    # Hash phase
+                    a = core.scratch[val + i] ^ core.scratch[node_val + i]
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        if op1 == "+":
+                            t1 = (a + val1) % (2**32)
+                        else:
+                            t1 = a ^ val1
+                        if op3 == "<<":
+                            t2 = (a << val3) % (2**32)
+                        else:
+                            t2 = a >> val3
+                        if op2 == "+":
+                            a = (t1 + t2) % (2**32)
+                        else:
+                            a = t1 ^ t2
+                    # Tree step phase with idx*2 built-in
+                    index = core.scratch[idx + i] * 2  # idx*2 built into instruction
                     n = core.scratch[n_nodes + i]
                     new_index = index + 1 + (a & 1)
                     # Write both outputs
