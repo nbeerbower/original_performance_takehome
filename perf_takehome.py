@@ -225,136 +225,32 @@ class KernelBuilder:
 
         round_loop_start = len(self.instrs)
 
-        # Compute base addresses for all unroll lanes, overlapping with batch counter init
-        # Cycle 1: init batch_counter + compute base addresses [0-5]
+        # Compute base addresses with 16 ALU slots
+        # Key: compute all idx_base first (needed for loads), then val_base can overlap with loads
+        # Cycle 1: batch init + compute ALL idx_base[0-15] (16 ALU ops)
         self.add_bundle({
             "load": [("const", batch_counter, 0)],
-            "alu": [
-                ("+", idx_base[0], self.scratch["inp_indices_p"], offset_consts[0]),
-                ("+", val_base[0], self.scratch["inp_values_p"], offset_consts[0]),
-                ("+", idx_base[1], self.scratch["inp_indices_p"], offset_consts[1]),
-                ("+", val_base[1], self.scratch["inp_values_p"], offset_consts[1]),
-                ("+", idx_base[2], self.scratch["inp_indices_p"], offset_consts[2]),
-                ("+", val_base[2], self.scratch["inp_values_p"], offset_consts[2]),
-                ("+", idx_base[3], self.scratch["inp_indices_p"], offset_consts[3]),
-                ("+", val_base[3], self.scratch["inp_values_p"], offset_consts[3]),
-                ("+", idx_base[4], self.scratch["inp_indices_p"], offset_consts[4]),
-                ("+", val_base[4], self.scratch["inp_values_p"], offset_consts[4]),
-                ("+", idx_base[5], self.scratch["inp_indices_p"], offset_consts[5]),
-                ("+", val_base[5], self.scratch["inp_values_p"], offset_consts[5]),
-            ],
+            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
         })
-        # Cycle 2: compute base addresses [6-11]
+        # Cycle 2: compute ALL val_base[0-15] + load all idx[0-15] (16 ALU + 16 loads)
+        # idx_base is ready from cycle 1, so loads work correctly
         self.add_bundle({
-            "alu": [
-                ("+", idx_base[6], self.scratch["inp_indices_p"], offset_consts[6]),
-                ("+", val_base[6], self.scratch["inp_values_p"], offset_consts[6]),
-                ("+", idx_base[7], self.scratch["inp_indices_p"], offset_consts[7]),
-                ("+", val_base[7], self.scratch["inp_values_p"], offset_consts[7]),
-                ("+", idx_base[8], self.scratch["inp_indices_p"], offset_consts[8]),
-                ("+", val_base[8], self.scratch["inp_values_p"], offset_consts[8]),
-                ("+", idx_base[9], self.scratch["inp_indices_p"], offset_consts[9]),
-                ("+", val_base[9], self.scratch["inp_values_p"], offset_consts[9]),
-                ("+", idx_base[10], self.scratch["inp_indices_p"], offset_consts[10]),
-                ("+", val_base[10], self.scratch["inp_values_p"], offset_consts[10]),
-                ("+", idx_base[11], self.scratch["inp_indices_p"], offset_consts[11]),
-                ("+", val_base[11], self.scratch["inp_values_p"], offset_consts[11]),
-            ],
-        })
-        # Cycle 3: compute base addresses [12-15] + load idx[0-7]
-        self.add_bundle({
-            "alu": [
-                ("+", idx_base[12], self.scratch["inp_indices_p"], offset_consts[12]),
-                ("+", val_base[12], self.scratch["inp_values_p"], offset_consts[12]),
-                ("+", idx_base[13], self.scratch["inp_indices_p"], offset_consts[13]),
-                ("+", val_base[13], self.scratch["inp_values_p"], offset_consts[13]),
-                ("+", idx_base[14], self.scratch["inp_indices_p"], offset_consts[14]),
-                ("+", val_base[14], self.scratch["inp_values_p"], offset_consts[14]),
-                ("+", idx_base[15], self.scratch["inp_indices_p"], offset_consts[15]),
-                ("+", val_base[15], self.scratch["inp_values_p"], offset_consts[15]),
-            ],
-            "load": [
-                ("vload", v_idx[0], idx_base[0]),
-                ("vload", v_idx[1], idx_base[1]),
-                ("vload", v_idx[2], idx_base[2]),
-                ("vload", v_idx[3], idx_base[3]),
-                ("vload", v_idx[4], idx_base[4]),
-                ("vload", v_idx[5], idx_base[5]),
-                ("vload", v_idx[6], idx_base[6]),
-                ("vload", v_idx[7], idx_base[7]),
-            ],
-        })
-        # Cycle 4: load idx[8-15]
-        self.add_bundle({
-            "load": [
-                ("vload", v_idx[8], idx_base[8]),
-                ("vload", v_idx[9], idx_base[9]),
-                ("vload", v_idx[10], idx_base[10]),
-                ("vload", v_idx[11], idx_base[11]),
-                ("vload", v_idx[12], idx_base[12]),
-                ("vload", v_idx[13], idx_base[13]),
-                ("vload", v_idx[14], idx_base[14]),
-                ("vload", v_idx[15], idx_base[15]),
-            ],
+            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
 
         batch_loop_start = len(self.instrs)
 
-        # === LOAD PHASE: Load val vectors and compute addresses ===
-        # With 8 load slots and 32 VALU slots, can do 8 loads + addr computations per cycle
-        for u in range(0, UNROLL, 8):
-            bundle = {"load": [
-                ("vload", v_val[u], val_base[u]),
-                ("vload", v_val[u+1], val_base[u+1]),
-                ("vload", v_val[u+2], val_base[u+2]),
-                ("vload", v_val[u+3], val_base[u+3]),
-                ("vload", v_val[u+4], val_base[u+4]),
-                ("vload", v_val[u+5], val_base[u+5]),
-                ("vload", v_val[u+6], val_base[u+6]),
-                ("vload", v_val[u+7], val_base[u+7]),
-            ]}
-            # Compute addresses for 8 indices per cycle
-            valu_ops = [
-                ("+", v_addr[u], v_forest_p, v_idx[u]),
-                ("+", v_addr[u+1], v_forest_p, v_idx[u+1]),
-                ("+", v_addr[u+2], v_forest_p, v_idx[u+2]),
-                ("+", v_addr[u+3], v_forest_p, v_idx[u+3]),
-                ("+", v_addr[u+4], v_forest_p, v_idx[u+4]),
-                ("+", v_addr[u+5], v_forest_p, v_idx[u+5]),
-                ("+", v_addr[u+6], v_forest_p, v_idx[u+6]),
-                ("+", v_addr[u+7], v_forest_p, v_idx[u+7]),
-            ]
-            bundle["valu"] = valu_ops
-            self.add_bundle(bundle)
-
-        # === GATHER + idx*2 (OVERLAPPED) ===
-        # Cycle 1: gather[0-7] + idx*2[0-7]
+        # === LOAD PHASE: Load all val vectors in 1 cycle (16 load slots) ===
         self.add_bundle({
-            "load": [
-                ("scratch_gather", v_node_val[0], v_idx[0], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[1], v_idx[1], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[2], v_idx[2], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[3], v_idx[3], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[4], v_idx[4], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[5], v_idx[5], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[6], v_idx[6], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[7], v_idx[7], tree_cache, CACHE_SIZE),
-            ],
-            "valu": [("*", v_idx[j], v_idx[j], v_two) for j in range(8)],
+            "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)],
+            "valu": [("+", v_addr[i], v_forest_p, v_idx[i]) for i in range(UNROLL)],
         })
-        # Cycle 2: gather[8-15] + idx*2[8-15]
+
+        # === GATHER + idx*2 (ALL IN 1 CYCLE with 16 load slots) ===
         self.add_bundle({
-            "load": [
-                ("scratch_gather", v_node_val[8], v_idx[8], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[9], v_idx[9], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[10], v_idx[10], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[11], v_idx[11], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[12], v_idx[12], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[13], v_idx[13], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[14], v_idx[14], tree_cache, CACHE_SIZE),
-                ("scratch_gather", v_node_val[15], v_idx[15], tree_cache, CACHE_SIZE),
-            ],
-            "valu": [("*", v_idx[j], v_idx[j], v_two) for j in range(8, 16)],
+            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
+            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
         })
 
         # === XOR + HASH PHASE ===
@@ -397,136 +293,30 @@ class KernelBuilder:
         ops = [("tree_step", v_idx[i], v_idx[i], v_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # === STORE PHASE (with pointer updates where safe) ===
-        # Key insight: After a store completes, that pointer can be updated for next iter
-        # idx stores happen cycles 1-2, val stores cycles 3-4
+        # === STORE PHASE (with 16 store/load slots) ===
+        # With 16 slots, we can do all 16 idx stores in 1 cycle, all 16 val stores in 1 cycle
+        # And all 16 idx loads in 1 cycle, with pointer updates overlapped
 
-        # Cycle 1: store idx[0-7]
-        self.add_bundle({"store": [
-            ("vstore", idx_base[0], v_idx[0]),
-            ("vstore", idx_base[1], v_idx[1]),
-            ("vstore", idx_base[2], v_idx[2]),
-            ("vstore", idx_base[3], v_idx[3]),
-            ("vstore", idx_base[4], v_idx[4]),
-            ("vstore", idx_base[5], v_idx[5]),
-            ("vstore", idx_base[6], v_idx[6]),
-            ("vstore", idx_base[7], v_idx[7]),
-        ]})
-
-        # Cycle 2: store idx[8-15] + update idx_base[0-7] (already used)
+        # Cycle 1: store all idx[0-15] + compare (16 stores + 1 ALU)
         self.add_bundle({
-            "store": [
-                ("vstore", idx_base[8], v_idx[8]),
-                ("vstore", idx_base[9], v_idx[9]),
-                ("vstore", idx_base[10], v_idx[10]),
-                ("vstore", idx_base[11], v_idx[11]),
-                ("vstore", idx_base[12], v_idx[12]),
-                ("vstore", idx_base[13], v_idx[13]),
-                ("vstore", idx_base[14], v_idx[14]),
-                ("vstore", idx_base[15], v_idx[15]),
-            ],
-            "alu": [
-                ("+", idx_base[0], idx_base[0], stride_const),
-                ("+", idx_base[1], idx_base[1], stride_const),
-                ("+", idx_base[2], idx_base[2], stride_const),
-                ("+", idx_base[3], idx_base[3], stride_const),
-                ("+", idx_base[4], idx_base[4], stride_const),
-                ("+", idx_base[5], idx_base[5], stride_const),
-                ("+", idx_base[6], idx_base[6], stride_const),
-                ("+", idx_base[7], idx_base[7], stride_const),
-            ],
-        })
-
-        # Cycle 3: store val[0-7] + update idx_base[8-15] (already used)
-        self.add_bundle({
-            "store": [
-                ("vstore", val_base[0], v_val[0]),
-                ("vstore", val_base[1], v_val[1]),
-                ("vstore", val_base[2], v_val[2]),
-                ("vstore", val_base[3], v_val[3]),
-                ("vstore", val_base[4], v_val[4]),
-                ("vstore", val_base[5], v_val[5]),
-                ("vstore", val_base[6], v_val[6]),
-                ("vstore", val_base[7], v_val[7]),
-            ],
-            "alu": [
-                ("+", idx_base[8], idx_base[8], stride_const),
-                ("+", idx_base[9], idx_base[9], stride_const),
-                ("+", idx_base[10], idx_base[10], stride_const),
-                ("+", idx_base[11], idx_base[11], stride_const),
-                ("+", idx_base[12], idx_base[12], stride_const),
-                ("+", idx_base[13], idx_base[13], stride_const),
-                ("+", idx_base[14], idx_base[14], stride_const),
-                ("+", idx_base[15], idx_base[15], stride_const),
-            ],
-        })
-
-        # Cycle 4: store val[8-15] + update val_base[0-7] (already used)
-        self.add_bundle({
-            "store": [
-                ("vstore", val_base[8], v_val[8]),
-                ("vstore", val_base[9], v_val[9]),
-                ("vstore", val_base[10], v_val[10]),
-                ("vstore", val_base[11], v_val[11]),
-                ("vstore", val_base[12], v_val[12]),
-                ("vstore", val_base[13], v_val[13]),
-                ("vstore", val_base[14], v_val[14]),
-                ("vstore", val_base[15], v_val[15]),
-            ],
-            "alu": [
-                ("+", val_base[0], val_base[0], stride_const),
-                ("+", val_base[1], val_base[1], stride_const),
-                ("+", val_base[2], val_base[2], stride_const),
-                ("+", val_base[3], val_base[3], stride_const),
-                ("+", val_base[4], val_base[4], stride_const),
-                ("+", val_base[5], val_base[5], stride_const),
-                ("+", val_base[6], val_base[6], stride_const),
-                ("+", val_base[7], val_base[7], stride_const),
-            ],
-        })
-
-        # Cycle 5: update val_base[8-15] + load idx[0-7]
-        self.add_bundle({
-            "alu": [
-                ("+", val_base[8], val_base[8], stride_const),
-                ("+", val_base[9], val_base[9], stride_const),
-                ("+", val_base[10], val_base[10], stride_const),
-                ("+", val_base[11], val_base[11], stride_const),
-                ("+", val_base[12], val_base[12], stride_const),
-                ("+", val_base[13], val_base[13], stride_const),
-                ("+", val_base[14], val_base[14], stride_const),
-                ("+", val_base[15], val_base[15], stride_const),
-            ],
-            "load": [
-                ("vload", v_idx[0], idx_base[0]),
-                ("vload", v_idx[1], idx_base[1]),
-                ("vload", v_idx[2], idx_base[2]),
-                ("vload", v_idx[3], idx_base[3]),
-                ("vload", v_idx[4], idx_base[4]),
-                ("vload", v_idx[5], idx_base[5]),
-                ("vload", v_idx[6], idx_base[6]),
-                ("vload", v_idx[7], idx_base[7]),
-            ],
-        })
-
-        # Cycle 6: load idx[8-15] + compare (overlapped) + increment
-        # Compare BEFORE increment, using (n_vec_iters - 1) as threshold
-        self.add_bundle({
-            "load": [
-                ("vload", v_idx[8], idx_base[8]),
-                ("vload", v_idx[9], idx_base[9]),
-                ("vload", v_idx[10], idx_base[10]),
-                ("vload", v_idx[11], idx_base[11]),
-                ("vload", v_idx[12], idx_base[12]),
-                ("vload", v_idx[13], idx_base[13]),
-                ("vload", v_idx[14], idx_base[14]),
-                ("vload", v_idx[15], idx_base[15]),
-            ],
+            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(UNROLL)],
             "alu": [("<", loop_cond, batch_counter, n_vec_iters_m1_const)],
+        })
+
+        # Cycle 2: store all val[0-15] + update all idx_base[0-15] (16 stores + 16 ALU)
+        self.add_bundle({
+            "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
+            "alu": [("+", idx_base[i], idx_base[i], stride_const) for i in range(UNROLL)],
+        })
+
+        # Cycle 3: update all val_base[0-15] + load all idx[0-15] + increment counter (16 ALU + 16 loads + 1 flow)
+        self.add_bundle({
+            "alu": [("+", val_base[i], val_base[i], stride_const) for i in range(UNROLL)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
             "flow": [("add_imm", batch_counter, batch_counter, 1)],
         })
 
-        # Cycle 7: cond_jump
+        # Cycle 4: cond_jump
         self.add("flow", ("cond_jump", loop_cond, batch_loop_start))
 
         # Round loop control - ALL rounds use cache (full tree is cached)
