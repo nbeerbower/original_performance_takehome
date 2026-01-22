@@ -29,7 +29,6 @@ class KernelBuilder:
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
-        self.const_map = {}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -53,13 +52,13 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized kernel within real constraints:
-        load:2, valu:6, alu:12, store:2, flow:1
+        Optimized kernel - key insight from "cheating" solution:
+        Keep idx/val in scratch across all 16 rounds, only load/store once per chunk.
         """
-        n_chunks = batch_size // VLEN  # 32 chunks
+        n_chunks = batch_size // VLEN  # 32
 
         # =========================================================
-        # PHASE 1: ALLOCATE ALL SCRATCH FIRST
+        # ALLOCATE SCRATCH
         # =========================================================
 
         # Header variables
@@ -68,10 +67,10 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Scalar temps
+        # Temps
         tmp = [self.alloc_scratch(f"tmp{i}") for i in range(8)]
 
-        # Vector registers
+        # Vector registers - keep idx/val in scratch across rounds!
         v_idx = self.alloc_scratch("v_idx", VLEN)
         v_val = self.alloc_scratch("v_val", VLEN)
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
@@ -84,7 +83,15 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
-        # Hash stage vector constants
+        # Multiply-add constants for hash optimization
+        # Stage 0: val*4097 + c1 (since 1 + 2^12 = 4097)
+        # Stage 2: val*33 + c1 (since 1 + 2^5 = 33)
+        # Stage 4: val*9 + c1 (since 1 + 2^3 = 9)
+        v_mul_0 = self.alloc_scratch("v_mul_0", VLEN)  # 4097
+        v_mul_2 = self.alloc_scratch("v_mul_2", VLEN)  # 33
+        v_mul_4 = self.alloc_scratch("v_mul_4", VLEN)  # 9
+
+        # Hash constants (pre-broadcast)
         v_hash = []
         for hi in range(len(HASH_STAGES)):
             v_c1 = self.alloc_scratch(f"v_hc1_{hi}", VLEN)
@@ -97,9 +104,10 @@ class KernelBuilder:
         two_c = self.alloc_scratch("two_c")
         vlen_c = self.alloc_scratch("vlen_c")
         n_chunks_c = self.alloc_scratch("n_chunks_c")
-        rounds_c = self.alloc_scratch("rounds_c")
+        mul_0_c = self.alloc_scratch("mul_0_c")  # 4097
+        mul_2_c = self.alloc_scratch("mul_2_c")  # 33
+        mul_4_c = self.alloc_scratch("mul_4_c")  # 9
 
-        # Hash scalar constants
         hash_c = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.alloc_scratch(f"hc1_{hi}")
@@ -108,100 +116,170 @@ class KernelBuilder:
 
         # Loop control
         chunk_i = self.alloc_scratch("chunk_i")
-        round_i = self.alloc_scratch("round_i")
         cond = self.alloc_scratch("cond")
 
         # =========================================================
-        # PHASE 2: LOAD CONSTANTS
+        # SETUP: Load constants (batch 2 per cycle)
         # =========================================================
 
-        # Load basic scalar constants (2 per cycle)
         self.add_bundle({"load": [("const", zero_c, 0), ("const", one_c, 1)]})
         self.add_bundle({"load": [("const", two_c, 2), ("const", vlen_c, VLEN)]})
-        self.add_bundle({"load": [("const", n_chunks_c, n_chunks), ("const", rounds_c, rounds)]})
+        self.add_bundle({"load": [("const", n_chunks_c, n_chunks), ("const", mul_0_c, 4097)]})
+        self.add_bundle({"load": [("const", mul_2_c, 33), ("const", mul_4_c, 9)]})
 
-        # Load hash constants
-        for hi, (c1, c3, val1, val3) in enumerate(hash_c):
+        for c1, c3, val1, val3 in hash_c:
             self.add_bundle({"load": [("const", c1, val1), ("const", c3, val3)]})
 
-        # Load header values
+        # Load header (batch 2 per cycle)
         for i in range(0, len(init_vars), 2):
-            self.add_bundle({"load": [("const", tmp[0], i), ("const", tmp[1], i + 1 if i + 1 < len(init_vars) else 0)]})
+            self.add_bundle({"load": [("const", tmp[0], i), ("const", tmp[1], i+1 if i+1 < len(init_vars) else 0)]})
             loads = [("load", self.scratch[init_vars[i]], tmp[0])]
             if i + 1 < len(init_vars):
                 loads.append(("load", self.scratch[init_vars[i+1]], tmp[1]))
             self.add_bundle({"load": loads})
 
-        # Broadcast vector constants
+        # Broadcast vector constants (max 6 valu per cycle)
         self.add_bundle({"valu": [
             ("vbroadcast", v_zero, zero_c),
             ("vbroadcast", v_one, one_c),
             ("vbroadcast", v_two, two_c),
             ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ("vbroadcast", v_mul_0, mul_0_c),
+            ("vbroadcast", v_mul_2, mul_2_c),
         ]})
+        self.add_bundle({"valu": [("vbroadcast", v_mul_4, mul_4_c)]})
 
-        # Broadcast hash constants (6 valu slots, can do 6 broadcasts per cycle)
         for hi in range(0, len(HASH_STAGES), 3):
             vops = []
             for j in range(min(3, len(HASH_STAGES) - hi)):
                 v_c1, v_c3 = v_hash[hi + j]
                 c1, c3, _, _ = hash_c[hi + j]
-                vops.append(("vbroadcast", v_c1, c1))
-                vops.append(("vbroadcast", v_c3, c3))
+                vops.extend([("vbroadcast", v_c1, c1), ("vbroadcast", v_c3, c3)])
             self.add_bundle({"valu": vops})
 
         self.add("flow", ("pause",))
 
         # =========================================================
-        # PHASE 3: MAIN LOOP
+        # MAIN LOOP: For each chunk, do ALL 16 rounds
+        # Key insight: keep idx/val in scratch, minimize memory traffic
         # =========================================================
-
-        self.add_bundle({"load": [("const", round_i, 0)]})
-        round_loop = len(self.instrs)
 
         self.add_bundle({"load": [("const", chunk_i, 0)]})
         chunk_loop = len(self.instrs)
 
-        # Compute addresses: addr = base + chunk_i * VLEN
+        # Load idx and val for this chunk (ONCE per chunk)
         self.add_bundle({"alu": [("*", tmp[0], chunk_i, vlen_c)]})
         self.add_bundle({"alu": [
             ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
             ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
         ]})
-
-        # Load v_idx and v_val
         self.add_bundle({"load": [("vload", v_idx, tmp[0]), ("vload", v_val, tmp[1])]})
 
-        # Gather tree nodes (2 scalar loads per cycle)
-        for vi in range(0, VLEN, 2):
+        # FULLY UNROLLED: 16 rounds with idx/val staying in scratch
+        for round_num in range(rounds):
+            # Gather tree nodes - PIPELINED with XOR overlapped (5 cycles for gather+XOR)
+            # Use scalar alu XOR to overlap with gather (12 alu slots available)
+
+            # Cycle 1: compute addresses for elements 0,1
             self.add_bundle({"alu": [
-                ("+", tmp[2], self.scratch["forest_values_p"], v_idx + vi),
-                ("+", tmp[3], self.scratch["forest_values_p"], v_idx + vi + 1),
+                ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 0),
+                ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 1),
             ]})
-            self.add_bundle({"load": [
-                ("load", v_node_val + vi, tmp[2]),
-                ("load", v_node_val + vi + 1, tmp[3]),
-            ]})
+            # Cycle 2: load[0,1] + addr[2,3]
+            self.add_bundle({
+                "load": [
+                    ("load", v_node_val + 0, tmp[2]),
+                    ("load", v_node_val + 1, tmp[3]),
+                ],
+                "alu": [
+                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 2),
+                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 3),
+                ]
+            })
+            # Cycle 3: load[2,3] + addr[4,5] + XOR[0,1]
+            self.add_bundle({
+                "load": [
+                    ("load", v_node_val + 2, tmp[2]),
+                    ("load", v_node_val + 3, tmp[3]),
+                ],
+                "alu": [
+                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 4),
+                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 5),
+                    ("^", v_val + 0, v_val + 0, v_node_val + 0),
+                    ("^", v_val + 1, v_val + 1, v_node_val + 1),
+                ]
+            })
+            # Cycle 4: load[4,5] + addr[6,7] + XOR[2,3]
+            self.add_bundle({
+                "load": [
+                    ("load", v_node_val + 4, tmp[2]),
+                    ("load", v_node_val + 5, tmp[3]),
+                ],
+                "alu": [
+                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 6),
+                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 7),
+                    ("^", v_val + 2, v_val + 2, v_node_val + 2),
+                    ("^", v_val + 3, v_val + 3, v_node_val + 3),
+                ]
+            })
+            # Cycle 5: load[6,7] + XOR[4,5]
+            self.add_bundle({
+                "load": [
+                    ("load", v_node_val + 6, tmp[2]),
+                    ("load", v_node_val + 7, tmp[3]),
+                ],
+                "alu": [
+                    ("^", v_val + 4, v_val + 4, v_node_val + 4),
+                    ("^", v_val + 5, v_val + 5, v_node_val + 5),
+                ]
+            })
+            # Cycle 6: XOR[6,7] - must wait for load to complete
+            self.add_bundle({
+                "alu": [
+                    ("^", v_val + 6, v_val + 6, v_node_val + 6),
+                    ("^", v_val + 7, v_val + 7, v_node_val + 7),
+                ]
+            })
 
-        # Hash computation
-        self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
+            # Use multiply_add for stages 0, 2, 4 (saves 1 cycle each)
+            # Stage 0: ("+", c1, "+", "<<", 12) → val*4097 + c1
+            v_c1_0, _ = v_hash[0]
+            self.add_bundle({"valu": [("multiply_add", v_val, v_val, v_mul_0, v_c1_0)]})
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            v_c1, v_c3 = v_hash[hi]
+            # Stage 1: ("^", c1, "^", ">>", 19) → (val^c1) ^ (val>>19)
+            v_c1_1, v_c3_1 = v_hash[1]
+            self.add_bundle({"valu": [("^", v_tmp1, v_val, v_c1_1), (">>", v_tmp2, v_val, v_c3_1)]})
+            self.add_bundle({"valu": [("^", v_val, v_tmp1, v_tmp2)]})
+
+            # Stage 2: ("+", c1, "+", "<<", 5) → val*33 + c1
+            v_c1_2, _ = v_hash[2]
+            self.add_bundle({"valu": [("multiply_add", v_val, v_val, v_mul_2, v_c1_2)]})
+
+            # Stage 3: ("+", c1, "^", "<<", 9) → (val+c1) ^ (val<<9)
+            v_c1_3, v_c3_3 = v_hash[3]
+            self.add_bundle({"valu": [("+", v_tmp1, v_val, v_c1_3), ("<<", v_tmp2, v_val, v_c3_3)]})
+            self.add_bundle({"valu": [("^", v_val, v_tmp1, v_tmp2)]})
+
+            # Stage 4: ("+", c1, "+", "<<", 3) → val*9 + c1
+            v_c1_4, _ = v_hash[4]
+            self.add_bundle({"valu": [("multiply_add", v_val, v_val, v_mul_4, v_c1_4)]})
+
+            # Stage 5: ("^", c1, "^", ">>", 16) → (val^c1) ^ (val>>16)
+            v_c1_5, v_c3_5 = v_hash[5]
+            self.add_bundle({"valu": [("^", v_tmp1, v_val, v_c1_5), (">>", v_tmp2, v_val, v_c3_5)]})
+            self.add_bundle({"valu": [("^", v_val, v_tmp1, v_tmp2)]})
+
+            # Tree step: idx = idx*2 + 1 + (val & 1), with bounds check
+            # Use multiply_add: idx*2 + 1 in one cycle
             self.add_bundle({"valu": [
-                (op1, v_tmp1, v_val, v_c1),
-                (op3, v_tmp2, v_val, v_c3),
+                ("multiply_add", v_idx, v_idx, v_two, v_one),  # idx = idx*2 + 1
+                ("&", v_tmp1, v_val, v_one),  # tmp1 = val & 1
             ]})
-            self.add_bundle({"valu": [(op2, v_val, v_tmp1, v_tmp2)]})
+            self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})  # idx = idx + tmp1
+            self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
+            self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
 
-        # Tree step
-        self.add_bundle({"valu": [("*", v_idx, v_idx, v_two), ("&", v_tmp1, v_val, v_one)]})
-        self.add_bundle({"valu": [("+", v_idx, v_idx, v_one)]})
-        self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})
-        self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
-        self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
-
-        # Store results
+        # Store results ONCE after all 16 rounds complete
         self.add_bundle({"alu": [("*", tmp[0], chunk_i, vlen_c)]})
         self.add_bundle({"alu": [
             ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
@@ -209,14 +287,10 @@ class KernelBuilder:
         ]})
         self.add_bundle({"store": [("vstore", tmp[0], v_idx), ("vstore", tmp[1], v_val)]})
 
-        # Loop control - increment FIRST, then compare in next cycle
+        # Chunk loop control
         self.add_bundle({"flow": [("add_imm", chunk_i, chunk_i, 1)]})
         self.add_bundle({"alu": [("<", cond, chunk_i, n_chunks_c)]})
         self.add_bundle({"flow": [("cond_jump", cond, chunk_loop)]})
-
-        self.add_bundle({"flow": [("add_imm", round_i, round_i, 1)]})
-        self.add_bundle({"alu": [("<", cond, round_i, rounds_c)]})
-        self.add_bundle({"flow": [("cond_jump", cond, round_loop)]})
 
         self.add("flow", ("pause",))
 
