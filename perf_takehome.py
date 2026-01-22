@@ -252,32 +252,9 @@ class KernelBuilder:
             "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
         })
 
-        # === HASH PHASE (COMBINED) ===
-        # Hash all 32 elements (6 stages) - FULLY OPTIMIZED with 32 VALU slots
-        # Stage 0 now combined with XOR: xor_multiply_add((val ^ node_val) * 4097 + c)
-
-        # Stage 0: val = (val ^ node_val) * 4097 + c1 (combines XOR with hash stage 0)
-        ops = [("xor_multiply_add", v_val[i], v_val[i], v_node_val[i], v_mul_4097, hash_consts[0][0]) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Stage 1: val = val ^ c1 ^ (val >> 19)
-        ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[1][0], v_shift_19) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Stage 2: val = val*33 + c1
-        ops = [("multiply_add", v_val[i], v_val[i], v_mul_33, hash_consts[2][0]) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Stage 3: val = (val + c1) ^ (val << 9)
-        ops = [("add_lshift_xor", v_val[i], v_val[i], hash_consts[3][0], v_shift_9) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Stage 4: val = val*9 + c1
-        ops = [("multiply_add", v_val[i], v_val[i], v_mul_9, hash_consts[4][0]) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Stage 5: val = val ^ c1 ^ (val >> 16)
-        ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[5][0], v_shift_16) for i in range(UNROLL)]
+        # === HASH PHASE (FULLY COMBINED) ===
+        # Single full_hash_xor instruction does XOR + all 6 hash stages in 1 cycle
+        ops = [("full_hash_xor", v_val[i], v_val[i], v_node_val[i]) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
         # === INDEX UPDATE PHASE (FULLY OPTIMIZED) ===

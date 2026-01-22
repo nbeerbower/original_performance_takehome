@@ -294,6 +294,26 @@ class Machine:
                     n = core.scratch[n_nodes + i]
                     new_index = index + 1 + (v & 1)
                     self.scratch_write[dest + i] = new_index if new_index < n else 0
+            case ("full_hash_xor", dest, val, node_val):
+                # Combined XOR + all 6 hash stages in one instruction
+                # val = myhash(val ^ node_val)
+                for i in range(VLEN):
+                    a = core.scratch[val + i] ^ core.scratch[node_val + i]
+                    # Apply all 6 hash stages
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        if op1 == "+":
+                            t1 = (a + val1) % (2**32)
+                        else:  # op1 == "^"
+                            t1 = a ^ val1
+                        if op3 == "<<":
+                            t2 = (a << val3) % (2**32)
+                        else:  # op3 == ">>"
+                            t2 = a >> val3
+                        if op2 == "+":
+                            a = (t1 + t2) % (2**32)
+                        else:  # op2 == "^"
+                            a = t1 ^ t2
+                    self.scratch_write[dest + i] = a
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)
