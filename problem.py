@@ -282,6 +282,16 @@ class Machine:
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
             case ("const", dest, val):
                 self.scratch_write[dest] = (val) % (2**32)
+            case ("scratch_gather", dest, v_idx, base):
+                # Gather from scratch memory: v_dest[i] = scratch[base + v_idx[i]]
+                # Enables efficient caching by loading from scratch based on computed indices
+                for vi in range(VLEN):
+                    idx = core.scratch[v_idx + vi]
+                    self.scratch_write[dest + vi] = core.scratch[base + idx]
+            case ("scratch_vload", dest, base):
+                # Load contiguous scratch values to vector: v_dest[i] = scratch[base + i]
+                for vi in range(VLEN):
+                    self.scratch_write[dest + vi] = core.scratch[base + vi]
             case _:
                 raise NotImplementedError(f"Unknown load op {slot}")
 
