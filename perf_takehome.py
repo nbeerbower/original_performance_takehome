@@ -122,8 +122,8 @@ class KernelBuilder:
         # Offset constants for base address computation
         offset_consts = [alloc_scalar(u * VLEN, f"offset_{u}") for u in range(UNROLL)]
 
-        # Cache stride offsets (n_cache_slots = 128 for 128-way parallel loading)
-        n_cache_slots = 128
+        # Cache stride offsets (n_cache_slots = 256 for 256-way parallel loading)
+        n_cache_slots = 256
         cache_stride = (n_nodes + n_cache_slots - 1) // n_cache_slots
         cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN
         cache_offset_consts = [alloc_scalar(i * cache_stride, f"cache_offset_{i}") for i in range(n_cache_slots)]
