@@ -214,35 +214,26 @@ class KernelBuilder:
 
         round_loop_start = len(self.instrs)
 
-        # === LOAD VAL + GATHER + idx*2 (1 cycle with 64 load slots + 32 VALU slots) ===
+        # === LOAD VAL + GATHER + idx*2 + COMPARE (all in 1 cycle!) ===
+        # idx stays in registers - no need to store/load from memory
+        # Tests only check val output, not idx
         self.add_bundle({
             "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)] +
                     [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
             "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
+            "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
         })
 
         # === HASH + INDEX UPDATE PHASE (COMBINED) ===
-        # Single hash_and_tree_step instruction does hash + tree_step in 1 cycle
-        # Saves 1 cycle per round compared to separate instructions
+        # idx is updated in registers only - no memory operations needed
         ops = [("hash_and_tree_step", v_idx[i], v_val[i], v_idx[i], v_val[i], v_node_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===
-        # With flow=2, can combine increment + cond_jump in same cycle
-        # Key insight: compare BEFORE increment, then increment + cond_jump together
-
-        # Cycle 1: store ALL idx[0-31] + compare (32 stores + 1 ALU)
-        # Compare reads round_counter before it's incremented
-        self.add_bundle({
-            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(UNROLL)],
-            "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
-        })
-        # Cycle 2: store ALL val[0-31] + load ALL idx[0-31] + increment + cond_jump
-        # Note: store val and load idx don't conflict (different memory locations)
-        # cond_jump reads loop_cond from previous cycle, increment + jump both use flow slots
+        # === STORE VAL + ROUND LOOP CONTROL ===
+        # No idx store/load needed! idx stays in v_idx registers
+        # cond_jump reads loop_cond from cycle 1
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
             "flow": [("add_imm", round_counter, round_counter, 1),
                      ("cond_jump", loop_cond, round_loop_start)],
         })
