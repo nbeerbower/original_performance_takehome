@@ -157,6 +157,11 @@ class KernelBuilder:
         batch_counter = self.alloc_scratch("batch_counter")
         loop_cond = self.alloc_scratch("loop_cond")
 
+        # Precompute offset constants for parallel base address computation (BEFORE pause)
+        offset_consts = []
+        for u in range(UNROLL):
+            offset_consts.append(self.scratch_const(u * VLEN, f"offset_{u}"))
+
         self.add("flow", ("pause",))
 
         # Pre-broadcast constants
@@ -168,24 +173,18 @@ class KernelBuilder:
 
         round_loop_start = len(self.instrs)
 
-        # Initialize batch counter
+        # Initialize batch counter (each round starts with batch 0)
         self.add("load", ("const", batch_counter, 0))
 
-        # Compute base addresses for all unroll lanes
-        # idx_base[0] = inp_indices_p, idx_base[1] = inp_indices_p + VLEN, etc.
-        self.add_bundle({
-            "alu": [
-                ("+", idx_base[0], self.scratch["inp_indices_p"], zero_const),
-                ("+", val_base[0], self.scratch["inp_values_p"], zero_const),
-            ]
-        })
-        for u in range(1, UNROLL):
-            self.add_bundle({
-                "alu": [
-                    ("+", idx_base[u], idx_base[u-1], vlen_const),
-                    ("+", val_base[u], val_base[u-1], vlen_const),
-                ]
-            })
+        # Compute base addresses for all unroll lanes IN PARALLEL
+        # idx_base[u] = inp_indices_p + u*VLEN, val_base[u] = inp_values_p + u*VLEN
+        # With 12 ALU slots, we can do 6 idx + 6 val = 12 ops per cycle
+        for u in range(0, UNROLL, 6):
+            alu_ops = []
+            for i in range(u, min(u + 6, UNROLL)):
+                alu_ops.append(("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]))
+                alu_ops.append(("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]))
+            self.add_bundle({"alu": alu_ops})
 
         # === PROLOGUE: Load first iteration's idx vectors ===
         # This is done once before the loop; subsequent iterations load idx during stores
