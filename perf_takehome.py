@@ -251,25 +251,15 @@ class KernelBuilder:
 
         round_loop_start = len(self.instrs)
 
-        # === LOAD PHASE: Load all 32 val vectors (2 cycles with 16 load slots) ===
+        # === LOAD PHASE: Load all 32 val vectors (1 cycle with 32 load slots) ===
         self.add_bundle({
-            "load": [("vload", v_val[i], val_base[i]) for i in range(16)],
-        })
-        self.add_bundle({
-            "load": [("vload", v_val[i], val_base[i]) for i in range(16, UNROLL)],
+            "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)],
         })
 
-        # === GATHER + idx*2 (2 cycles with 16 load slots) ===
-        # Each gather must read idx BEFORE that idx is doubled
-        # Cycle 1: gather[0-15] + idx*2[0-15]
+        # === GATHER + idx*2 (1 cycle with 32 load slots + 32 VALU slots) ===
         self.add_bundle({
-            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(16)],
-            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(16)],
-        })
-        # Cycle 2: gather[16-31] + idx*2[16-31]
-        self.add_bundle({
-            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(16, UNROLL)],
-            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(16, UNROLL)],
+            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
+            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
         })
 
         # === HASH PHASE (COMBINED) ===
@@ -306,25 +296,23 @@ class KernelBuilder:
         self.add_bundle({"valu": ops})
 
         # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===
-        # Overlap round loop control and next round's idx load with store phase
+        # With 32 load slots, can load all idx for next round in one cycle
 
         # Cycle 1: store idx[0-15] + increment round_counter (flow)
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16)],
             "flow": [("add_imm", round_counter, round_counter, 1)],
         })
-        # Cycle 2: store idx[16-31] + compare + load idx[0-15] for next round
-        # idx[0-15] was stored in cycle 1, now available for reading
+        # Cycle 2: store idx[16-31] + compare
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16, UNROLL)],
             "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
         })
-        # Cycle 3: store val[0-15] + load idx[16-31] for next round
-        # idx[16-31] was stored in cycle 2, now available for reading
+        # Cycle 3: store val[0-15] + load ALL idx[0-31] for next round (32 load slots)
+        # All idx was stored by cycle 2, now available for reading
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(16)],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16, UNROLL)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
         # Cycle 4: store val[16-31] + cond_jump (flow)
         # cond_jump goes to round_loop_start which is AFTER initial idx load
