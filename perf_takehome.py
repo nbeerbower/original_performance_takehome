@@ -87,9 +87,9 @@ class KernelBuilder:
         2. VLIW packing - multiple operations per cycle
         3. Hardware loop for rounds, fully unrolled batch
         4. Parallel hash stages - exploit ALU parallelism
-        5. UNROLL=16 - process 128 elements per batch iteration (2 iterations per round)
+        5. UNROLL=32 - process all 256 elements in single batch iteration (no batch loop)
         """
-        UNROLL = 16  # Process 16 vector chunks per iteration
+        UNROLL = 32  # Process 32 vector chunks = 256 elements (full batch)
 
         # Load memory layout from header
         init_vars = [
@@ -225,46 +225,58 @@ class KernelBuilder:
 
         round_loop_start = len(self.instrs)
 
-        # Compute base addresses with 16 ALU slots
-        # Key: compute all idx_base first (needed for loads), then val_base can overlap with loads
-        # Cycle 1: batch init + compute ALL idx_base[0-15] (16 ALU ops)
-        self.add_bundle({
-            "load": [("const", batch_counter, 0)],
-            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
-        })
-        # Cycle 2: compute ALL val_base[0-15] + load all idx[0-15] (16 ALU + 16 loads)
-        # idx_base is ready from cycle 1, so loads work correctly
-        self.add_bundle({
-            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
-        })
+        # === ROUND SETUP (with 16 ALU/load slots for UNROLL=32) ===
+        # Compute all 32 idx_base first (2 cycles), then 32 val_base + load idx (2 cycles)
 
-        batch_loop_start = len(self.instrs)
-
-        # === LOAD PHASE: Load all val vectors in 1 cycle (16 load slots) ===
+        # Cycle 1: compute idx_base[0-15]
         self.add_bundle({
-            "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)],
-            "valu": [("+", v_addr[i], v_forest_p, v_idx[i]) for i in range(UNROLL)],
+            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(16)],
         })
-
-        # === GATHER + idx*2 (ALL IN 1 CYCLE with 16 load slots) ===
+        # Cycle 2: compute idx_base[16-31]
         self.add_bundle({
-            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
-            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
+            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(16, UNROLL)],
+        })
+        # Cycle 3: compute val_base[0-15] + load idx[0-15]
+        self.add_bundle({
+            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(16)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
+        })
+        # Cycle 4: compute val_base[16-31] + load idx[16-31]
+        self.add_bundle({
+            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(16, UNROLL)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16, UNROLL)],
         })
 
-        # === XOR + HASH PHASE (COMBINED) ===
-        # Hash all elements (6 stages) - FULLY OPTIMIZED
+        # === LOAD PHASE: Load all 32 val vectors (2 cycles with 16 load slots) ===
+        self.add_bundle({
+            "load": [("vload", v_val[i], val_base[i]) for i in range(16)],
+        })
+        self.add_bundle({
+            "load": [("vload", v_val[i], val_base[i]) for i in range(16, UNROLL)],
+        })
+
+        # === GATHER + idx*2 (2 cycles with 16 load slots) ===
+        # Each gather must read idx BEFORE that idx is doubled
+        # Cycle 1: gather[0-15] + idx*2[0-15]
+        self.add_bundle({
+            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(16)],
+            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(16)],
+        })
+        # Cycle 2: gather[16-31] + idx*2[16-31]
+        self.add_bundle({
+            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(16, UNROLL)],
+            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(16, UNROLL)],
+        })
+
+        # === HASH PHASE (COMBINED) ===
+        # Hash all 32 elements (6 stages) - FULLY OPTIMIZED with 32 VALU slots
         # Stage 0 now combined with XOR: xor_multiply_add((val ^ node_val) * 4097 + c)
-        # Stages 2, 4: multiply_add (val*k + c)
-        # Stages 1, 5: xor_rshift_xor (val ^ c ^ (val >> k))
-        # Stage 3: add_lshift_xor ((val + c) ^ (val << k))
 
         # Stage 0: val = (val ^ node_val) * 4097 + c1 (combines XOR with hash stage 0)
         ops = [("xor_multiply_add", v_val[i], v_val[i], v_node_val[i], v_mul_4097, hash_consts[0][0]) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # Stage 1: val = (val ^ c1) ^ (val >> 19) = val ^ c1 ^ (val >> 19)
+        # Stage 1: val = val ^ c1 ^ (val >> 19)
         ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[1][0], v_shift_19) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
@@ -280,40 +292,33 @@ class KernelBuilder:
         ops = [("multiply_add", v_val[i], v_val[i], v_mul_9, hash_consts[4][0]) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # Stage 5: val = (val ^ c1) ^ (val >> 16) = val ^ c1 ^ (val >> 16)
+        # Stage 5: val = val ^ c1 ^ (val >> 16)
         ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[5][0], v_shift_16) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
         # === INDEX UPDATE PHASE (FULLY OPTIMIZED) ===
         # Use tree_step instruction: idx = (idx + 1 + (val & 1)) if in_bounds else 0
-        # Combines all 4 operations into 1 cycle
         ops = [("tree_step", v_idx[i], v_idx[i], v_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # === STORE PHASE (with 16 store/load slots) ===
-        # With 16 slots, we can do all 16 idx stores in 1 cycle, all 16 val stores in 1 cycle
-        # And all 16 idx loads in 1 cycle, with pointer updates overlapped
-        # Move batch counter increment to cycle 1 to free up flow slot for cond_jump in cycle 3
+        # === STORE PHASE (with 16 store slots, no batch loop needed with n_vec_iters=1) ===
+        # Since UNROLL=32 processes all 256 elements in one pass, no batch loop
 
-        # Cycle 1: store all idx[0-15] + compare + increment (16 stores + 2 ALU)
-        # With write-at-end, compare reads old batch_counter value before increment writes
+        # Cycle 1: store idx[0-15]
         self.add_bundle({
-            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(UNROLL)],
-            "alu": [("<", loop_cond, batch_counter, n_vec_iters_m1_const),
-                    ("+", batch_counter, batch_counter, one_const)],
+            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16)],
         })
-
-        # Cycle 2: store all val[0-15] + update all idx_base[0-15] (16 stores + 16 ALU)
+        # Cycle 2: store idx[16-31]
         self.add_bundle({
-            "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
-            "alu": [("+", idx_base[i], idx_base[i], stride_const) for i in range(UNROLL)],
+            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16, UNROLL)],
         })
-
-        # Cycle 3: update all val_base[0-15] + load all idx[0-15] + cond_jump (16 ALU + 16 loads + 1 flow)
+        # Cycle 3: store val[0-15]
         self.add_bundle({
-            "alu": [("+", val_base[i], val_base[i], stride_const) for i in range(UNROLL)],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
-            "flow": [("cond_jump", loop_cond, batch_loop_start)],
+            "store": [("vstore", val_base[i], v_val[i]) for i in range(16)],
+        })
+        # Cycle 4: store val[16-31]
+        self.add_bundle({
+            "store": [("vstore", val_base[i], v_val[i]) for i in range(16, UNROLL)],
         })
 
         # Round loop control - ALL rounds use cache (full tree is cached)
