@@ -217,13 +217,21 @@ class KernelBuilder:
         # Process in chunks: gather chunk N, then XOR+hash chunk N while gathering chunk N+1
         CHUNK = 4  # Optimal chunk size (tested: 4 > 2 > 8)
 
-        # Gather first chunk (no overlap possible yet)
+        # Gather first chunk + precompute idx*2 (doesn't depend on hash)
+        # This overlaps 16 gather cycles with idx*2 computation
+        idx_mult_done = 0
         for i in range(0, VLEN, 2):
             for u in range(CHUNK):
-                self.add_bundle({"load": [
+                bundle = {"load": [
                     ("load_offset", v_node_val[u], v_addr[u], i),
                     ("load_offset", v_node_val[u], v_addr[u], i + 1),
-                ]})
+                ]}
+                # Precompute idx = idx * 2 (up to 6 per cycle)
+                if idx_mult_done < UNROLL:
+                    valu_ops = [("*", v_idx[j], v_idx[j], v_two) for j in range(idx_mult_done, min(idx_mult_done + 6, UNROLL))]
+                    bundle["valu"] = valu_ops
+                    idx_mult_done += 6
+                self.add_bundle(bundle)
 
         # Process remaining chunks with overlap
         for chunk_start in range(CHUNK, UNROLL, CHUNK):
@@ -315,12 +323,9 @@ class KernelBuilder:
                 self.add_bundle({"valu": ops})
 
         # === INDEX UPDATE PHASE ===
-        # tmp1 = val & 1, idx = idx * 2 (2 ops per lane, 6 slots max)
-        for u in range(0, UNROLL, 3):
-            ops = []
-            for i in range(u, min(u+3, UNROLL)):
-                ops.append(("&", v_tmp1[i], v_val[i], v_one))
-                ops.append(("*", v_idx[i], v_idx[i], v_two))
+        # tmp1 = val & 1 (idx*2 already done during first chunk gather)
+        for u in range(0, UNROLL, 6):
+            ops = [("&", v_tmp1[i], v_val[i], v_one) for i in range(u, min(u+6, UNROLL))]
             self.add_bundle({"valu": ops})
 
         # tmp1 = tmp1 + 1
