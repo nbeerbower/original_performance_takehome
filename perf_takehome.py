@@ -220,14 +220,8 @@ class KernelBuilder:
                     bundle["alu"] = alu_ops
                 self.add_bundle(bundle)
 
-        # Initialize round counter
-        self.add("load", ("const", round_counter, 0))
-
-        round_loop_start = len(self.instrs)
-
-        # === ROUND SETUP (with 16 ALU/load slots for UNROLL=32) ===
-        # Compute all 32 idx_base first (2 cycles), then 32 val_base + load idx (2 cycles)
-
+        # === PRECOMPUTE BASE ADDRESSES (only once, before round loop) ===
+        # Base addresses don't change between rounds, so compute them once
         # Cycle 1: compute idx_base[0-15]
         self.add_bundle({
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(16)],
@@ -236,14 +230,23 @@ class KernelBuilder:
         self.add_bundle({
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(16, UNROLL)],
         })
-        # Cycle 3: compute val_base[0-15] + load idx[0-15]
+        # Cycle 3: compute val_base[0-15]
         self.add_bundle({
             "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(16)],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
         })
-        # Cycle 4: compute val_base[16-31] + load idx[16-31]
+        # Cycle 4: compute val_base[16-31] + init round counter
         self.add_bundle({
             "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(16, UNROLL)],
+            "load": [("const", round_counter, 0)],
+        })
+
+        round_loop_start = len(self.instrs)
+
+        # === ROUND START: Load idx (2 cycles) ===
+        self.add_bundle({
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
+        })
+        self.add_bundle({
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(16, UNROLL)],
         })
 
@@ -301,30 +304,30 @@ class KernelBuilder:
         ops = [("tree_step", v_idx[i], v_idx[i], v_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # === STORE PHASE (with 16 store slots, no batch loop needed with n_vec_iters=1) ===
-        # Since UNROLL=32 processes all 256 elements in one pass, no batch loop
+        # === STORE PHASE + ROUND LOOP CONTROL (overlapped) ===
+        # Overlap round loop control with store phase to save cycles
 
-        # Cycle 1: store idx[0-15]
+        # Cycle 1: store idx[0-15] + increment round_counter (flow)
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16)],
+            "flow": [("add_imm", round_counter, round_counter, 1)],
         })
-        # Cycle 2: store idx[16-31]
+        # Cycle 2: store idx[16-31] + compare (ALU)
+        # Compare reads the NEW round_counter (incremented in cycle 1)
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16, UNROLL)],
+            "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
         })
         # Cycle 3: store val[0-15]
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(16)],
         })
-        # Cycle 4: store val[16-31]
+        # Cycle 4: store val[16-31] + cond_jump (flow)
+        # cond_jump after all stores complete
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(16, UNROLL)],
+            "flow": [("cond_jump", loop_cond, round_loop_start)],
         })
-
-        # Round loop control - ALL rounds use cache (full tree is cached)
-        self.add("flow", ("add_imm", round_counter, round_counter, 1))
-        self.add("alu", ("<", loop_cond, round_counter, self.scratch["rounds"]))
-        self.add("flow", ("cond_jump", loop_cond, round_loop_start))
 
         self.instrs.append({"flow": [("pause",)]})
 
