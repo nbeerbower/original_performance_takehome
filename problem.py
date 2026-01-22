@@ -276,6 +276,15 @@ class Machine:
                     cv = core.scratch[c + i]
                     sh = core.scratch[shift_amt + i]
                     self.scratch_write[dest + i] = ((v + cv) ^ (v << sh)) % (2**32)
+            case ("tree_step", dest, idx, val, n_nodes):
+                # Combined tree traversal step: dest = (idx + 1 + (val & 1)) if in bounds else 0
+                # idx is already idx*2 from earlier, so this computes the child index
+                for i in range(VLEN):
+                    index = core.scratch[idx + i]
+                    v = core.scratch[val + i]
+                    n = core.scratch[n_nodes + i]
+                    new_index = index + 1 + (v & 1)
+                    self.scratch_write[dest + i] = new_index if new_index < n else 0
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)

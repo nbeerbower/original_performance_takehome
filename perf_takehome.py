@@ -391,23 +391,10 @@ class KernelBuilder:
         ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[5][0], v_shift_16) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # === INDEX UPDATE PHASE (OPTIMIZED) ===
-        # Compute idx = (idx + 1 + (val & 1)) * (idx + 1 + (val & 1) < n_nodes)
-        # Cycle 1: tmp1 = idx + 1, tmp2 = val & 1 (in parallel, 32 ops)
-        ops = [("+", v_tmp1[i], v_idx[i], v_one) for i in range(UNROLL)]
-        ops += [("&", v_tmp2[i], v_val[i], v_one) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Cycle 2: idx = tmp1 + tmp2 (16 ops)
-        ops = [("+", v_idx[i], v_tmp1[i], v_tmp2[i]) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Cycle 3: tmp1 = idx < n_nodes (16 ops)
-        ops = [("<", v_tmp1[i], v_idx[i], v_n_nodes) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # Cycle 4: idx = idx * tmp1 (16 ops)
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(UNROLL)]
+        # === INDEX UPDATE PHASE (FULLY OPTIMIZED) ===
+        # Use tree_step instruction: idx = (idx + 1 + (val & 1)) if in_bounds else 0
+        # Combines all 4 operations into 1 cycle
+        ops = [("tree_step", v_idx[i], v_idx[i], v_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
         # === STORE PHASE (with pointer updates where safe) ===
