@@ -88,24 +88,71 @@ class KernelBuilder:
         3. Hardware loop for rounds, fully unrolled batch
         4. Parallel hash stages - exploit ALU parallelism
         5. UNROLL=32 - process all 256 elements in single batch iteration (no batch loop)
+        6. Batched constant loading - load all constants in parallel
         """
         UNROLL = 32  # Process 32 vector chunks = 256 elements (full batch)
 
-        # Load memory layout from header
+        # =========================================================
+        # PHASE 1: ALLOCATE ALL SCRATCH MEMORY (no instructions yet)
+        # =========================================================
+
+        # Header variables (loaded from memory)
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-
-        # Efficient header loading
         addr_temps = [self.alloc_scratch() for _ in range(2)]
+
+        # Scalar constants - allocate addresses only
+        scalar_consts = {}  # value -> address
+        def alloc_scalar(val, name=None):
+            if val not in scalar_consts:
+                scalar_consts[val] = self.alloc_scratch(name)
+            return scalar_consts[val]
+
+        zero_const = alloc_scalar(0, "zero")
+        one_const = alloc_scalar(1, "one")
+        two_const = alloc_scalar(2, "two")
+        eight_const = alloc_scalar(8, "eight")
+        vlen_const = alloc_scalar(VLEN, "vlen")
+
+        # Offset constants for base address computation
+        offset_consts = [alloc_scalar(u * VLEN, f"offset_{u}") for u in range(UNROLL)]
+
+        # Cache stride offsets (n_cache_slots = 32)
+        n_cache_slots = 32
+        cache_stride = (n_nodes + n_cache_slots - 1) // n_cache_slots
+        cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN
+        cache_offset_consts = [alloc_scalar(i * cache_stride, f"cache_offset_{i}") for i in range(n_cache_slots)]
+
+        # Vector registers - allocate scratch space
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
+        v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
+        v_node_val = [self.alloc_scratch(f"v_node_val_{u}", VLEN) for u in range(UNROLL)]
+
+        # Scalar base addresses and loop counters
+        idx_base = [self.alloc_scratch(f"idx_base_{u}") for u in range(UNROLL)]
+        val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
+        round_counter = self.alloc_scratch("round_counter")
+        loop_cond = self.alloc_scratch("loop_cond")
+
+        # Cache pointers
+        cache_ptr = [self.alloc_scratch(f"cache_ptr_{i}") for i in range(n_cache_slots)]
+
+        # Tree cache (full tree)
+        CACHE_SIZE = n_nodes
+        tree_cache = self.alloc_scratch("tree_cache", CACHE_SIZE)
+
+        # =========================================================
+        # PHASE 2: BATCHED CONSTANT LOADING (minimal cycles)
+        # =========================================================
+
+        # Load header: const addresses + load values in batched cycles
+        # Cycle pattern: const addr, load from addr (each pair)
         for i in range(0, len(init_vars), 2):
             bundle = {"load": []}
             for j in range(min(2, len(init_vars) - i)):
@@ -116,97 +163,35 @@ class KernelBuilder:
                 bundle["load"].append(("load", self.scratch[init_vars[i + j]], addr_temps[j]))
             self.add_bundle(bundle)
 
-        # Scalar constants
-        zero_const = self.scratch_const(0, "zero")
-        one_const = self.scratch_const(1, "one")
-        two_const = self.scratch_const(2, "two")
-        vlen_const = self.scratch_const(VLEN, "vlen")
-        stride_const = self.scratch_const(VLEN * UNROLL, "stride")
-        n_vec_iters = batch_size // (VLEN * UNROLL)  # 256 // 128 = 2
-        n_vec_iters_const = self.scratch_const(n_vec_iters, "n_vec_iters")
-        n_vec_iters_m1_const = self.scratch_const(n_vec_iters - 1, "n_vec_iters_m1")
-
-        # Vector constants
-        v_zero = self.scratch_vconst(0, "v_zero")
-        v_one = self.scratch_vconst(1, "v_one")
-        v_two = self.scratch_vconst(2, "v_two")
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-
-        # Hash constants (vectorized)
-        hash_consts = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1 = self.scratch_vconst(val1, f"hash_{hi}_c1")
-            c3 = self.scratch_vconst(val3, f"hash_{hi}_c3")
-            hash_consts.append((c1, c3))
-
-        # Multiply constants for optimized hash stages 0, 2, 4
-        # Stage 0: val = val*4097 + c1 (since 1 + 2^12 = 4097)
-        # Stage 2: val = val*33 + c1 (since 1 + 2^5 = 33)
-        # Stage 4: val = val*9 + c1 (since 1 + 2^3 = 9)
-        v_mul_4097 = self.scratch_vconst(4097, "v_mul_4097")
-        v_mul_33 = self.scratch_vconst(33, "v_mul_33")
-        v_mul_9 = self.scratch_vconst(9, "v_mul_9")
-
-        # Shift constants for optimized hash stages 1, 3, 5
-        # Stage 1: val = (val ^ c) ^ (val >> 19)
-        # Stage 3: val = (val + c) ^ (val << 9)
-        # Stage 5: val = (val ^ c) ^ (val >> 16)
-        v_shift_19 = self.scratch_vconst(19, "v_shift_19")
-        v_shift_9 = self.scratch_vconst(9, "v_shift_9")
-        v_shift_16 = self.scratch_vconst(16, "v_shift_16")
-
-        # Vector scratch registers for UNROLL lanes
-        # Note: v_tmp3 removed - no longer needed since we use arithmetic instead of vselect
-        v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
-        v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
-        v_node_val = [self.alloc_scratch(f"v_node_val_{u}", VLEN) for u in range(UNROLL)]
-        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{u}", VLEN) for u in range(UNROLL)]
-        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{u}", VLEN) for u in range(UNROLL)]
-        v_addr = [self.alloc_scratch(f"v_addr_{u}", VLEN) for u in range(UNROLL)]
-
-        # Scalar base addresses for each unroll lane
-        idx_base = [self.alloc_scratch(f"idx_base_{u}") for u in range(UNROLL)]
-        val_base = [self.alloc_scratch(f"val_base_{u}") for u in range(UNROLL)]
-
-        # Loop counters
-        round_counter = self.alloc_scratch("round_counter")
-        batch_counter = self.alloc_scratch("batch_counter")
-        loop_cond = self.alloc_scratch("loop_cond")
-
-        # Precompute offset constants for parallel base address computation (BEFORE pause)
-        offset_consts = []
-        for u in range(UNROLL):
-            offset_consts.append(self.scratch_const(u * VLEN, f"offset_{u}"))
-
-        # === FULL TREE CACHE ===
-        # Cache ALL tree nodes to enable scratch_gather for all rounds
-        # With SCRATCH_SIZE=4096, we have room for the full tree (2047 nodes for height 10)
-        CACHE_SIZE = n_nodes  # Cache all nodes
-        tree_cache = self.alloc_scratch("tree_cache", CACHE_SIZE)
+        # Load ALL scalar constants in batches of 64 (max load slots)
+        const_list = list(scalar_consts.items())  # [(value, addr), ...]
+        for batch_start in range(0, len(const_list), 64):
+            batch = const_list[batch_start:batch_start + 64]
+            self.add_bundle({
+                "load": [("const", addr, val) for val, addr in batch]
+            })
 
         self.add("flow", ("pause",))
 
-        # Pre-broadcast constants
-        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
+        # =========================================================
+        # PHASE 3: VECTOR BROADCASTS + CACHE LOADING
+        # =========================================================
 
-        # Load ALL tree nodes into cache using vload with 32 parallel pointers
-        # 2047 nodes / 32 ≈ 64 nodes per pointer = 8 vloads each, all in parallel = 8 cycles
-        n_cache_slots = 32
-        cache_ptr = [self.alloc_scratch(f"cache_ptr_{i}") for i in range(n_cache_slots)]
-        cache_stride = (n_nodes + n_cache_slots - 1) // n_cache_slots  # Nodes per slot
-        cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN  # Round up to VLEN
-        eight_const = self.scratch_const(8, "eight")
-
-        # Initialize pointers: ptr[i] = forest_p + i * cache_stride (32 ALU ops, 1 cycle)
+        # Broadcast scalar constants to vector registers (2 ops, can batch)
         self.add_bundle({
-            "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"],
-                    self.scratch_const(i * cache_stride, f"cache_offset_{i}"))
+            "valu": [
+                ("vbroadcast", v_two, two_const),
+                ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ]
+        })
+
+        # Initialize cache pointers: ptr[i] = forest_p + i * cache_stride (32 ALU ops, 1 cycle)
+        self.add_bundle({
+            "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i])
                    for i in range(n_cache_slots)],
         })
 
-        # Load in parallel: each cycle loads 32 vectors (one from each pointer)
+        # Load tree nodes in parallel: each cycle loads 32 vectors
         for chunk in range(0, cache_stride, VLEN):
             load_ops = []
             alu_ops = []
@@ -221,15 +206,16 @@ class KernelBuilder:
                     bundle["alu"] = alu_ops
                 self.add_bundle(bundle)
 
-        # === PRECOMPUTE BASE ADDRESSES (only once, before round loop) ===
-        # With 32 ALU slots, compute all bases faster
-        # Cycle 1: compute ALL idx_base[0-31] (32 ALU ops)
+        # =========================================================
+        # PHASE 4: PRECOMPUTE BASE ADDRESSES + ROUND LOOP
+        # =========================================================
+
+        # Compute ALL idx_base[0-31] (32 ALU ops)
         self.add_bundle({
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
         })
-        # Cycle 2: compute ALL val_base[0-31] + init round counter (32 ALU + 1 load)
-        # Note: round_counter starts at 1 because we compare BEFORE incrementing
-        # (compare counter < rounds, then increment + jump in same cycle)
+        # Compute ALL val_base[0-31] + init round counter
+        # round_counter starts at 1 because we compare BEFORE incrementing
         self.add_bundle({
             "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
             "load": [("const", round_counter, 1)],
