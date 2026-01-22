@@ -304,27 +304,46 @@ class KernelBuilder:
                     ]})
                 gather_idx += 2
 
-        # XOR and hash last chunk (no more gather to overlap)
-        last_start = UNROLL - CHUNK
-        for u in range(last_start, UNROLL, 6):
-            xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": xor_ops})
+        # === LAST CHUNK HASH + INDEX UPDATE FOR EARLY ELEMENTS ===
+        # Elements 0-11 are done hashing, so we can start their index update
+        # while hashing the last chunk (12-15)
+        last_start = UNROLL - CHUNK  # 12
+
+        # XOR last chunk + start index update for elements 0-5 (tmp1 = val & 1)
+        xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(last_start, UNROLL)]
+        idx_ops = [("&", v_tmp1[i], v_val[i], v_one) for i in range(0, min(6-len(xor_ops), 12))]
+        self.add_bundle({"valu": xor_ops + idx_ops})
+
+        # Hash stages with interleaved index update for elements 0-11
+        early_idx_update_done = len(idx_ops)
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1, c3 = hash_consts[hi]
-            for u in range(last_start, UNROLL, 3):
-                ops = []
-                for i in range(u, min(u+3, UNROLL)):
-                    ops.append((op1, v_tmp1[i], v_val[i], c1))
-                    ops.append((op3, v_tmp2[i], v_val[i], c3))
-                self.add_bundle({"valu": ops})
-            for u in range(last_start, UNROLL, 6):
-                ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(u, min(u+6, UNROLL))]
-                self.add_bundle({"valu": ops})
 
-        # === INDEX UPDATE PHASE ===
-        # tmp1 = val & 1 (idx*2 already done during first chunk gather)
-        for u in range(0, UNROLL, 6):
+            # tmp1/tmp2 for last chunk, interleaved with index update
+            for u in range(last_start, UNROLL, 3):
+                hash_ops = []
+                for i in range(u, min(u+3, UNROLL)):
+                    hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
+                    hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
+
+                # Overlap with index update for elements 0-11
+                if early_idx_update_done < 12:
+                    remaining_slots = 6 - len(hash_ops)
+                    idx_ops = [("&", v_tmp1[j], v_val[j], v_one)
+                               for j in range(early_idx_update_done, min(early_idx_update_done + remaining_slots, 12))]
+                    self.add_bundle({"valu": hash_ops + idx_ops})
+                    early_idx_update_done += len(idx_ops)
+                else:
+                    self.add_bundle({"valu": hash_ops})
+
+            # combine for last chunk
+            combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(last_start, UNROLL)]
+            self.add_bundle({"valu": combine_ops})
+
+        # === INDEX UPDATE PHASE (continue) ===
+        # Finish tmp1 = val & 1 for remaining elements (12-15)
+        for u in range(12, UNROLL, 6):
             ops = [("&", v_tmp1[i], v_val[i], v_one) for i in range(u, min(u+6, UNROLL))]
             self.add_bundle({"valu": ops})
 
