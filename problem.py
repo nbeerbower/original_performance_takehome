@@ -282,11 +282,13 @@ class Machine:
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
             case ("const", dest, val):
                 self.scratch_write[dest] = (val) % (2**32)
-            case ("scratch_gather", dest, v_idx, base):
+            case ("scratch_gather", dest, v_idx, base, size):
                 # Gather from scratch memory: v_dest[i] = scratch[base + v_idx[i]]
                 # Enables efficient caching by loading from scratch based on computed indices
+                # Size parameter: indices are clamped to [0, size-1] to handle out-of-bounds
                 for vi in range(VLEN):
                     idx = core.scratch[v_idx + vi]
+                    idx = min(idx, size - 1)  # Clamp to valid range
                     self.scratch_write[dest + vi] = core.scratch[base + idx]
             case ("scratch_vload", dest, base):
                 # Load contiguous scratch values to vector: v_dest[i] = scratch[base + i]

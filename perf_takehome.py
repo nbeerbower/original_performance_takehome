@@ -169,6 +169,10 @@ class KernelBuilder:
         CACHED_ROUNDS = 8  # Rounds 1-8 use cache (idx < 511 guaranteed)
         tree_cache = self.alloc_scratch("tree_cache", CACHE_SIZE)
         cached_rounds_const = self.scratch_const(CACHED_ROUNDS, "cached_rounds")
+        v_cache_size = self.scratch_vconst(CACHE_SIZE, "v_cache_size")  # For conditional caching
+
+        # Reuse existing vectors for conditional caching:
+        # v_tmp1 = cache mask, v_tmp2 = memory values (both free before hash phase)
 
         self.add("flow", ("pause",))
 
@@ -249,8 +253,8 @@ class KernelBuilder:
         # Must do ALL gathers before modifying v_idx, since scratch_gather reads v_idx
         for u in range(0, UNROLL, 2):
             self.add_bundle({"load": [
-                ("scratch_gather", v_node_val[u], v_idx[u], tree_cache),
-                ("scratch_gather", v_node_val[u+1], v_idx[u+1], tree_cache),
+                ("scratch_gather", v_node_val[u], v_idx[u], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+1], v_idx[u+1], tree_cache, CACHE_SIZE),
             ]})
 
         # Now safe to modify v_idx: idx = idx * 2
@@ -412,7 +416,10 @@ class KernelBuilder:
             bundle["valu"] = valu_ops
             self.add_bundle(bundle)
 
-        # NON-CACHED GATHER using load_offset (original approach)
+        # NON-CACHED GATHER using load_offset with chunked overlapping
+        # Process in chunks of CHUNK=4 vectors, overlap hash with gather
+        CHUNK = 4
+
         # Gather first chunk + precompute idx*2
         idx_mult_done = 0
         for i in range(0, VLEN, 2):
