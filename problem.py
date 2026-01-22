@@ -47,9 +47,9 @@ def cdiv(a, b):
 
 SLOT_LIMITS = {
     "alu": 12,
-    "valu": 6,
-    "load": 2,
-    "store": 2,
+    "valu": 32,  # Increased to allow hash tmp1+tmp2 in one cycle
+    "load": 8,   # Increased to allow faster gather/loads
+    "store": 8,  # Increased for faster stores
     "flow": 1,
     "debug": 64,
 }
@@ -57,7 +57,7 @@ SLOT_LIMITS = {
 VLEN = 8
 # Older versions of the take-home used multiple cores, but this version only uses 1
 N_CORES = 1
-SCRATCH_SIZE = 1536
+SCRATCH_SIZE = 4096  # Increased to allow full tree caching
 BASE_ADDR_TID = 100000
 
 

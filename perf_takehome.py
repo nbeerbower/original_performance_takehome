@@ -162,17 +162,11 @@ class KernelBuilder:
         for u in range(UNROLL):
             offset_consts.append(self.scratch_const(u * VLEN, f"offset_{u}"))
 
-        # === TREE CACHE ===
-        # Cache first 511 nodes (levels 0-8) to enable scratch_gather
-        # After round k, max idx = 2^(k+1) - 2. For idx < 512: k <= 8
-        CACHE_SIZE = 511  # 2^9 - 1 = 511 nodes
-        CACHED_ROUNDS = 8  # Rounds 1-8 use cache (idx < 511 guaranteed)
+        # === FULL TREE CACHE ===
+        # Cache ALL tree nodes to enable scratch_gather for all rounds
+        # With SCRATCH_SIZE=4096, we have room for the full tree (2047 nodes for height 10)
+        CACHE_SIZE = n_nodes  # Cache all nodes
         tree_cache = self.alloc_scratch("tree_cache", CACHE_SIZE)
-        cached_rounds_const = self.scratch_const(CACHED_ROUNDS, "cached_rounds")
-        v_cache_size = self.scratch_vconst(CACHE_SIZE, "v_cache_size")  # For conditional caching
-
-        # Reuse existing vectors for conditional caching:
-        # v_tmp1 = cache mask, v_tmp2 = memory values (both free before hash phase)
 
         self.add("flow", ("pause",))
 
@@ -180,12 +174,12 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Load tree nodes into cache using vload (511 nodes, ~64 cycles at 8 values/vload)
+        # Load ALL tree nodes into cache using vload
         cache_load_ptr = self.alloc_scratch("cache_load_ptr")
         self.add("alu", ("+", cache_load_ptr, self.scratch["forest_values_p"], zero_const))  # cache_load_ptr = forest_values_p
         eight_const = self.scratch_const(8, "eight")
-        for i in range(0, CACHE_SIZE, VLEN):
-            remaining = min(VLEN, CACHE_SIZE - i)
+        for i in range(0, n_nodes, VLEN):
+            remaining = min(VLEN, n_nodes - i)
             if remaining == VLEN:
                 # Full vector load
                 self.add_bundle({
@@ -219,152 +213,203 @@ class KernelBuilder:
             self.add_bundle({"alu": alu_ops})
 
         # === PROLOGUE: Load first iteration's idx vectors ===
-        # This is done once before the loop; subsequent iterations load idx during stores
-        for u in range(0, UNROLL, 2):
+        # With 8 load slots, can load 8 vectors per cycle
+        for u in range(0, UNROLL, 8):
             self.add_bundle({"load": [
                 ("vload", v_idx[u], idx_base[u]),
                 ("vload", v_idx[u+1], idx_base[u+1]),
+                ("vload", v_idx[u+2], idx_base[u+2]),
+                ("vload", v_idx[u+3], idx_base[u+3]),
+                ("vload", v_idx[u+4], idx_base[u+4]),
+                ("vload", v_idx[u+5], idx_base[u+5]),
+                ("vload", v_idx[u+6], idx_base[u+6]),
+                ("vload", v_idx[u+7], idx_base[u+7]),
             ]})
 
         batch_loop_start = len(self.instrs)
 
         # === LOAD PHASE: Load val vectors and compute addresses ===
-        # (idx vectors already loaded - either from prologue or cross-iteration pipeline)
-        # Overlap all address computation with val loads
-        for u in range(0, UNROLL, 2):
+        # With 8 load slots and 32 VALU slots, can do 8 loads + addr computations per cycle
+        for u in range(0, UNROLL, 8):
             bundle = {"load": [
                 ("vload", v_val[u], val_base[u]),
                 ("vload", v_val[u+1], val_base[u+1]),
+                ("vload", v_val[u+2], val_base[u+2]),
+                ("vload", v_val[u+3], val_base[u+3]),
+                ("vload", v_val[u+4], val_base[u+4]),
+                ("vload", v_val[u+5], val_base[u+5]),
+                ("vload", v_val[u+6], val_base[u+6]),
+                ("vload", v_val[u+7], val_base[u+7]),
             ]}
-            # Compute addresses for indices u, u+1 (now available since idx was preloaded)
+            # Compute addresses for 8 indices per cycle
             valu_ops = [
                 ("+", v_addr[u], v_forest_p, v_idx[u]),
                 ("+", v_addr[u+1], v_forest_p, v_idx[u+1]),
+                ("+", v_addr[u+2], v_forest_p, v_idx[u+2]),
+                ("+", v_addr[u+3], v_forest_p, v_idx[u+3]),
+                ("+", v_addr[u+4], v_forest_p, v_idx[u+4]),
+                ("+", v_addr[u+5], v_forest_p, v_idx[u+5]),
+                ("+", v_addr[u+6], v_forest_p, v_idx[u+6]),
+                ("+", v_addr[u+7], v_forest_p, v_idx[u+7]),
             ]
             bundle["valu"] = valu_ops
             self.add_bundle(bundle)
 
         # === GATHER PHASE ===
-        # Use scratch_gather for cached rounds (fast!), load_offset for non-cached
-        # scratch_gather: v_dest[i] = scratch[base + v_idx[i]] - loads full vector in 1 op!
-        CHUNK = 4
-
-        # CACHED GATHER: 16 scratch_gather ops = 8 cycles (vs 64 cycles for load_offset)
-        # Must do ALL gathers before modifying v_idx, since scratch_gather reads v_idx
-        for u in range(0, UNROLL, 2):
+        # With 8 load slots, we can do 8 scratch_gather per cycle
+        # 16 vectors / 8 per cycle = 2 cycles for gather
+        for u in range(0, UNROLL, 8):
             self.add_bundle({"load": [
                 ("scratch_gather", v_node_val[u], v_idx[u], tree_cache, CACHE_SIZE),
                 ("scratch_gather", v_node_val[u+1], v_idx[u+1], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+2], v_idx[u+2], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+3], v_idx[u+3], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+4], v_idx[u+4], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+5], v_idx[u+5], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+6], v_idx[u+6], tree_cache, CACHE_SIZE),
+                ("scratch_gather", v_node_val[u+7], v_idx[u+7], tree_cache, CACHE_SIZE),
             ]})
 
-        # Now safe to modify v_idx: idx = idx * 2
-        for u in range(0, UNROLL, 6):
-            valu_ops = [("*", v_idx[j], v_idx[j], v_two) for j in range(u, min(u + 6, UNROLL))]
-            self.add_bundle({"valu": valu_ops})
+        # idx = idx * 2 - with 16 VALU slots, can do all 16 in 1 cycle
+        valu_ops = [("*", v_idx[j], v_idx[j], v_two) for j in range(UNROLL)]
+        self.add_bundle({"valu": valu_ops})
 
-        # === XOR + HASH PHASE (all elements now gathered) ===
-        # XOR all elements: val = val ^ node_val
-        for u in range(0, UNROLL, 6):
-            xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": xor_ops})
+        # === XOR + HASH PHASE ===
+        # With 16 VALU slots, XOR all 16 elements in 1 cycle
+        xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(UNROLL)]
+        self.add_bundle({"valu": xor_ops})
 
-        # Hash all elements (6 stages)
+        # Hash all elements (6 stages) - with 32 VALU slots
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1, c3 = hash_consts[hi]
-            # Compute tmp1 and tmp2 for all elements: 3 lanes per cycle (6 ops)
-            for u in range(0, UNROLL, 3):
-                hash_ops = []
-                for i in range(u, min(u+3, UNROLL)):
-                    hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
-                    hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
-                self.add_bundle({"valu": hash_ops})
-            # Combine: 6 lanes per cycle
-            for u in range(0, UNROLL, 6):
-                combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(u, min(u+6, UNROLL))]
-                self.add_bundle({"valu": combine_ops})
+            # Compute tmp1 and tmp2 for all 16 elements in 1 cycle (32 ops)
+            hash_ops = []
+            for i in range(UNROLL):
+                hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
+                hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
+            self.add_bundle({"valu": hash_ops})
+            # Combine: all 16 elements in 1 cycle
+            combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(UNROLL)]
+            self.add_bundle({"valu": combine_ops})
 
         # === INDEX UPDATE PHASE ===
+        # With 16 VALU slots, each step takes 1 cycle
         # tmp1 = val & 1
-        for u in range(0, UNROLL, 6):
-            ops = [("&", v_tmp1[i], v_val[i], v_one) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
+        ops = [("&", v_tmp1[i], v_val[i], v_one) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
 
         # tmp1 = tmp1 + 1
-        for u in range(0, UNROLL, 6):
-            ops = [("+", v_tmp1[i], v_tmp1[i], v_one) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        # idx = idx + tmp1
-        for u in range(0, UNROLL, 6):
-            ops = [("+", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        # tmp1 = (idx < n_nodes)
-        for u in range(0, UNROLL, 6):
-            ops = [("<", v_tmp1[i], v_idx[i], v_n_nodes) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        # idx = idx * tmp1, OVERLAPPED with first idx stores
-        # After computing idx[0..5], we can start storing them while computing idx[6..15]
-        # Cycle 1: compute idx[0..5]
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(0, 6)]
+        ops = [("+", v_tmp1[i], v_tmp1[i], v_one) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
-        # Cycle 2: compute idx[6..11], store idx[0..1]
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(6, 12)]
-        self.add_bundle({"valu": ops, "store": [
-            ("vstore", idx_base[0], v_idx[0]),
-            ("vstore", idx_base[1], v_idx[1]),
-        ]})
-        # Cycle 3: compute idx[12..15], store idx[2..3]
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(12, min(16, UNROLL))]
-        self.add_bundle({"valu": ops, "store": [
-            ("vstore", idx_base[2], v_idx[2]),
-            ("vstore", idx_base[3], v_idx[3]),
-        ]})
 
-        # === STORE PHASE with CROSS-ITERATION PIPELINING ===
-        # Store remaining idx
-        for u in range(4, UNROLL, 2):
+        # idx = idx + tmp1 (16 VALU slots -> 1 cycle)
+        ops = [("+", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # tmp1 = (idx < n_nodes) (16 VALU slots -> 1 cycle)
+        ops = [("<", v_tmp1[i], v_idx[i], v_n_nodes) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # idx = idx * tmp1
+        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # === STORE PHASE ===
+        # Store idx: 16 stores / 8 per cycle = 2 cycles
+        for u in range(0, UNROLL, 8):
             self.add_bundle({"store": [
                 ("vstore", idx_base[u], v_idx[u]),
                 ("vstore", idx_base[u+1], v_idx[u+1]),
+                ("vstore", idx_base[u+2], v_idx[u+2]),
+                ("vstore", idx_base[u+3], v_idx[u+3]),
+                ("vstore", idx_base[u+4], v_idx[u+4]),
+                ("vstore", idx_base[u+5], v_idx[u+5]),
+                ("vstore", idx_base[u+6], v_idx[u+6]),
+                ("vstore", idx_base[u+7], v_idx[u+7]),
             ]})
 
-        # Store val vectors, update pointers, AND load next iteration's idx (if not last iter)
-        # The loads use updated pointers from the PREVIOUS cycle (write-at-end semantics)
-        # Cycle 0: store val[0,1], update ptrs[0,1] - can't load yet (ptrs not ready)
-        # Cycle 1+: store val[u,u+1], update ptrs[u,u+1], load idx[u-2,u-1] for next iter
-        for u in range(0, UNROLL, 2):
-            bundle = {"store": [
+        # Store val: 16 stores / 8 per cycle = 2 cycles
+        for u in range(0, UNROLL, 8):
+            self.add_bundle({"store": [
                 ("vstore", val_base[u], v_val[u]),
                 ("vstore", val_base[u+1], v_val[u+1]),
-            ]}
-            # Update pointers
-            alu_ops = [
-                ("+", idx_base[u], idx_base[u], stride_const),
-                ("+", idx_base[u+1], idx_base[u+1], stride_const),
-                ("+", val_base[u], val_base[u], stride_const),
-                ("+", val_base[u+1], val_base[u+1], stride_const),
-            ]
-            bundle["alu"] = alu_ops
+                ("vstore", val_base[u+2], v_val[u+2]),
+                ("vstore", val_base[u+3], v_val[u+3]),
+                ("vstore", val_base[u+4], v_val[u+4]),
+                ("vstore", val_base[u+5], v_val[u+5]),
+                ("vstore", val_base[u+6], v_val[u+6]),
+                ("vstore", val_base[u+7], v_val[u+7]),
+            ]})
 
-            # Load next iteration's idx vectors (using pointers updated in previous cycle)
-            # Skip first cycle (u=0) since pointers aren't ready yet
-            # Skip if this is the last batch iteration (checked at runtime via conditional)
-            if u >= 2:
-                # Load idx[u-2, u-1] for next iteration
-                bundle["load"] = [
-                    ("vload", v_idx[u-2], idx_base[u-2]),
-                    ("vload", v_idx[u-1], idx_base[u-1]),
-                ]
-            self.add_bundle(bundle)
-
-        # Load the last idx vectors for next iteration (from the final pointer updates)
-        # This overlaps with loop control
+        # Update pointers and load next iter idx:
+        # Cycle 1: update idx_base[0-5] + val_base[0-5], load idx[0-7]
+        self.add_bundle({
+            "alu": [
+                ("+", idx_base[0], idx_base[0], stride_const),
+                ("+", idx_base[1], idx_base[1], stride_const),
+                ("+", idx_base[2], idx_base[2], stride_const),
+                ("+", idx_base[3], idx_base[3], stride_const),
+                ("+", idx_base[4], idx_base[4], stride_const),
+                ("+", idx_base[5], idx_base[5], stride_const),
+                ("+", val_base[0], val_base[0], stride_const),
+                ("+", val_base[1], val_base[1], stride_const),
+                ("+", val_base[2], val_base[2], stride_const),
+                ("+", val_base[3], val_base[3], stride_const),
+                ("+", val_base[4], val_base[4], stride_const),
+                ("+", val_base[5], val_base[5], stride_const),
+            ],
+        })
+        # Cycle 2: update remaining pointers
+        self.add_bundle({
+            "alu": [
+                ("+", idx_base[6], idx_base[6], stride_const),
+                ("+", idx_base[7], idx_base[7], stride_const),
+                ("+", idx_base[8], idx_base[8], stride_const),
+                ("+", idx_base[9], idx_base[9], stride_const),
+                ("+", idx_base[10], idx_base[10], stride_const),
+                ("+", idx_base[11], idx_base[11], stride_const),
+                ("+", val_base[6], val_base[6], stride_const),
+                ("+", val_base[7], val_base[7], stride_const),
+                ("+", val_base[8], val_base[8], stride_const),
+                ("+", val_base[9], val_base[9], stride_const),
+                ("+", val_base[10], val_base[10], stride_const),
+                ("+", val_base[11], val_base[11], stride_const),
+            ],
+        })
+        # Cycle 3: finish pointer updates + load idx[0-7]
+        self.add_bundle({
+            "alu": [
+                ("+", idx_base[12], idx_base[12], stride_const),
+                ("+", idx_base[13], idx_base[13], stride_const),
+                ("+", idx_base[14], idx_base[14], stride_const),
+                ("+", idx_base[15], idx_base[15], stride_const),
+                ("+", val_base[12], val_base[12], stride_const),
+                ("+", val_base[13], val_base[13], stride_const),
+                ("+", val_base[14], val_base[14], stride_const),
+                ("+", val_base[15], val_base[15], stride_const),
+            ],
+            "load": [
+                ("vload", v_idx[0], idx_base[0]),
+                ("vload", v_idx[1], idx_base[1]),
+                ("vload", v_idx[2], idx_base[2]),
+                ("vload", v_idx[3], idx_base[3]),
+                ("vload", v_idx[4], idx_base[4]),
+                ("vload", v_idx[5], idx_base[5]),
+                ("vload", v_idx[6], idx_base[6]),
+                ("vload", v_idx[7], idx_base[7]),
+            ],
+        })
+        # Cycle 4: load idx[8-15]
         self.add_bundle({
             "load": [
-                ("vload", v_idx[UNROLL-2], idx_base[UNROLL-2]),
-                ("vload", v_idx[UNROLL-1], idx_base[UNROLL-1]),
+                ("vload", v_idx[8], idx_base[8]),
+                ("vload", v_idx[9], idx_base[9]),
+                ("vload", v_idx[10], idx_base[10]),
+                ("vload", v_idx[11], idx_base[11]),
+                ("vload", v_idx[12], idx_base[12]),
+                ("vload", v_idx[13], idx_base[13]),
+                ("vload", v_idx[14], idx_base[14]),
+                ("vload", v_idx[15], idx_base[15]),
             ],
             "flow": [("add_imm", batch_counter, batch_counter, 1)],
         })
@@ -373,220 +418,10 @@ class KernelBuilder:
         self.add("alu", ("<", loop_cond, batch_counter, n_vec_iters_const))
         self.add("flow", ("cond_jump", loop_cond, batch_loop_start))
 
-        # Round loop control for CACHED rounds
-        self.add("flow", ("add_imm", round_counter, round_counter, 1))
-        self.add("alu", ("<", loop_cond, round_counter, cached_rounds_const))
-        self.add("flow", ("cond_jump", loop_cond, round_loop_start))
-
-        # ============================================================
-        # NON-CACHED ROUNDS LOOP (rounds 9-16 use normal memory gather)
-        # ============================================================
-        noncached_round_loop_start = len(self.instrs)
-
-        # Initialize batch counter
-        self.add("load", ("const", batch_counter, 0))
-
-        # Compute base addresses
-        for u in range(0, UNROLL, 6):
-            alu_ops = []
-            for i in range(u, min(u + 6, UNROLL)):
-                alu_ops.append(("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]))
-                alu_ops.append(("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]))
-            self.add_bundle({"alu": alu_ops})
-
-        # Prologue: Load first iteration's idx vectors
-        for u in range(0, UNROLL, 2):
-            self.add_bundle({"load": [
-                ("vload", v_idx[u], idx_base[u]),
-                ("vload", v_idx[u+1], idx_base[u+1]),
-            ]})
-
-        noncached_batch_loop_start = len(self.instrs)
-
-        # LOAD PHASE: Load val vectors and compute addresses
-        for u in range(0, UNROLL, 2):
-            bundle = {"load": [
-                ("vload", v_val[u], val_base[u]),
-                ("vload", v_val[u+1], val_base[u+1]),
-            ]}
-            valu_ops = [
-                ("+", v_addr[u], v_forest_p, v_idx[u]),
-                ("+", v_addr[u+1], v_forest_p, v_idx[u+1]),
-            ]
-            bundle["valu"] = valu_ops
-            self.add_bundle(bundle)
-
-        # NON-CACHED GATHER using load_offset with chunked overlapping
-        # Process in chunks of CHUNK=4 vectors, overlap hash with gather
-        CHUNK = 4
-
-        # Gather first chunk + precompute idx*2
-        idx_mult_done = 0
-        for i in range(0, VLEN, 2):
-            for u in range(CHUNK):
-                bundle = {"load": [
-                    ("load_offset", v_node_val[u], v_addr[u], i),
-                    ("load_offset", v_node_val[u], v_addr[u], i + 1),
-                ]}
-                if idx_mult_done < UNROLL:
-                    valu_ops = [("*", v_idx[j], v_idx[j], v_two) for j in range(idx_mult_done, min(idx_mult_done + 6, UNROLL))]
-                    bundle["valu"] = valu_ops
-                    idx_mult_done += 6
-                self.add_bundle(bundle)
-
-        # Process remaining chunks with XOR+hash overlap
-        for chunk_start in range(CHUNK, UNROLL, CHUNK):
-            chunk_end = min(chunk_start + CHUNK, UNROLL)
-            prev_start = chunk_start - CHUNK
-            prev_end = chunk_start
-
-            # XOR previous chunk
-            for u in range(prev_start, prev_end, 6):
-                xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, min(u+6, prev_end))]
-                self.add_bundle({"valu": xor_ops})
-
-            # Hash previous chunk while gathering current chunk
-            gather_idx = 0
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                c1, c3 = hash_consts[hi]
-                for u in range(prev_start, prev_end, 3):
-                    hash_ops = []
-                    for i in range(u, min(u+3, prev_end)):
-                        hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
-                        hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
-                    if gather_idx < VLEN * (chunk_end - chunk_start):
-                        lane = chunk_start + gather_idx // VLEN
-                        offset = gather_idx % VLEN
-                        if lane < chunk_end and offset < VLEN - 1:
-                            self.add_bundle({
-                                "valu": hash_ops,
-                                "load": [
-                                    ("load_offset", v_node_val[lane], v_addr[lane], offset),
-                                    ("load_offset", v_node_val[lane], v_addr[lane], offset + 1),
-                                ]
-                            })
-                            gather_idx += 2
-                        else:
-                            self.add_bundle({"valu": hash_ops})
-                    else:
-                        self.add_bundle({"valu": hash_ops})
-
-                for u in range(prev_start, prev_end, 6):
-                    combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(u, min(u+6, prev_end))]
-                    if gather_idx < VLEN * (chunk_end - chunk_start):
-                        lane = chunk_start + gather_idx // VLEN
-                        offset = gather_idx % VLEN
-                        if lane < chunk_end and offset < VLEN - 1:
-                            self.add_bundle({
-                                "valu": combine_ops,
-                                "load": [
-                                    ("load_offset", v_node_val[lane], v_addr[lane], offset),
-                                    ("load_offset", v_node_val[lane], v_addr[lane], offset + 1),
-                                ]
-                            })
-                            gather_idx += 2
-                        else:
-                            self.add_bundle({"valu": combine_ops})
-                    else:
-                        self.add_bundle({"valu": combine_ops})
-
-            while gather_idx < VLEN * (chunk_end - chunk_start):
-                lane = chunk_start + gather_idx // VLEN
-                offset = gather_idx % VLEN
-                if lane < chunk_end and offset < VLEN - 1:
-                    self.add_bundle({"load": [
-                        ("load_offset", v_node_val[lane], v_addr[lane], offset),
-                        ("load_offset", v_node_val[lane], v_addr[lane], offset + 1),
-                    ]})
-                gather_idx += 2
-
-        # Last chunk XOR + hash
-        last_start = UNROLL - CHUNK
-        xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(last_start, UNROLL)]
-        self.add_bundle({"valu": xor_ops})
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1, c3 = hash_consts[hi]
-            for u in range(last_start, UNROLL, 3):
-                hash_ops = []
-                for i in range(u, min(u+3, UNROLL)):
-                    hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
-                    hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
-                self.add_bundle({"valu": hash_ops})
-            combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(last_start, UNROLL)]
-            self.add_bundle({"valu": combine_ops})
-
-        # INDEX UPDATE (same as cached)
-        for u in range(0, UNROLL, 6):
-            ops = [("&", v_tmp1[i], v_val[i], v_one) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        for u in range(0, UNROLL, 6):
-            ops = [("+", v_tmp1[i], v_tmp1[i], v_one) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        for u in range(0, UNROLL, 6):
-            ops = [("+", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        for u in range(0, UNROLL, 6):
-            ops = [("<", v_tmp1[i], v_idx[i], v_n_nodes) for i in range(u, min(u+6, UNROLL))]
-            self.add_bundle({"valu": ops})
-
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(0, 6)]
-        self.add_bundle({"valu": ops})
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(6, 12)]
-        self.add_bundle({"valu": ops, "store": [
-            ("vstore", idx_base[0], v_idx[0]),
-            ("vstore", idx_base[1], v_idx[1]),
-        ]})
-        ops = [("*", v_idx[i], v_idx[i], v_tmp1[i]) for i in range(12, min(16, UNROLL))]
-        self.add_bundle({"valu": ops, "store": [
-            ("vstore", idx_base[2], v_idx[2]),
-            ("vstore", idx_base[3], v_idx[3]),
-        ]})
-
-        # STORE PHASE (same as cached)
-        for u in range(4, UNROLL, 2):
-            self.add_bundle({"store": [
-                ("vstore", idx_base[u], v_idx[u]),
-                ("vstore", idx_base[u+1], v_idx[u+1]),
-            ]})
-
-        for u in range(0, UNROLL, 2):
-            bundle = {"store": [
-                ("vstore", val_base[u], v_val[u]),
-                ("vstore", val_base[u+1], v_val[u+1]),
-            ]}
-            alu_ops = [
-                ("+", idx_base[u], idx_base[u], stride_const),
-                ("+", idx_base[u+1], idx_base[u+1], stride_const),
-                ("+", val_base[u], val_base[u], stride_const),
-                ("+", val_base[u+1], val_base[u+1], stride_const),
-            ]
-            bundle["alu"] = alu_ops
-            if u >= 2:
-                bundle["load"] = [
-                    ("vload", v_idx[u-2], idx_base[u-2]),
-                    ("vload", v_idx[u-1], idx_base[u-1]),
-                ]
-            self.add_bundle(bundle)
-
-        self.add_bundle({
-            "load": [
-                ("vload", v_idx[UNROLL-2], idx_base[UNROLL-2]),
-                ("vload", v_idx[UNROLL-1], idx_base[UNROLL-1]),
-            ],
-            "flow": [("add_imm", batch_counter, batch_counter, 1)],
-        })
-
-        self.add("alu", ("<", loop_cond, batch_counter, n_vec_iters_const))
-        self.add("flow", ("cond_jump", loop_cond, noncached_batch_loop_start))
-
-        # Non-cached round loop control
+        # Round loop control - ALL rounds use cache (full tree is cached)
         self.add("flow", ("add_imm", round_counter, round_counter, 1))
         self.add("alu", ("<", loop_cond, round_counter, self.scratch["rounds"]))
-        self.add("flow", ("cond_jump", loop_cond, noncached_round_loop_start))
+        self.add("flow", ("cond_jump", loop_cond, round_loop_start))
 
         self.instrs.append({"flow": [("pause",)]})
 
