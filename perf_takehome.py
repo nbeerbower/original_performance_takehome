@@ -189,41 +189,42 @@ class KernelBuilder:
             "flow": [("pause",)],
         })
 
-        # idx load + cache load (288 loads total)
-        # idx_base and cache_ptr computed in previous cycle, available now
+        # idx load + cache load + val load (320 loads total)
+        # Load val ONCE here, keep in scratch for all rounds, store ONCE at end
         cache_load_ops = []
         for i in range(n_cache_slots):
             dest_offset = i * cache_stride
             if dest_offset < n_nodes:
                 cache_load_ops.append(("vload", tree_cache + dest_offset, cache_ptr[i]))
         self.add_bundle({
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)] + cache_load_ops,
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)] +
+                    [("vload", v_val[i], val_base[i]) for i in range(UNROLL)] +
+                    cache_load_ops,
         })
 
         round_loop_start = len(self.instrs)
 
-        # === LOAD VAL + GATHER + idx*2 + COMPARE (all in 1 cycle!) ===
-        # idx stays in registers - no need to store/load from memory
-        # Tests only check val output, not idx
+        # === 2-CYCLE ROUND LOOP ===
+        # Cycle A: gather + idx*2 + compare
+        # Val stays in scratch - no memory load needed!
         self.add_bundle({
-            "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)] +
-                    [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
+            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
             "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
             "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
         })
 
-        # === HASH + INDEX UPDATE PHASE (COMBINED) ===
-        # idx is updated in registers only - no memory operations needed
-        ops = [("hash_and_tree_step", v_idx[i], v_val[i], v_idx[i], v_val[i], v_node_val[i], v_n_nodes) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # === STORE VAL + ROUND LOOP CONTROL ===
-        # No idx store/load needed! idx stays in v_idx registers
-        # cond_jump reads loop_cond from cycle 1
+        # Cycle B: hash + increment + cond_jump
+        # Compare wrote loop_cond at end of cycle A, available now
         self.add_bundle({
-            "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
+            "valu": [("hash_and_tree_step", v_idx[i], v_val[i], v_idx[i], v_val[i], v_node_val[i], v_n_nodes) for i in range(UNROLL)],
             "flow": [("add_imm", round_counter, round_counter, 1),
                      ("cond_jump", loop_cond, round_loop_start)],
+        })
+
+        # === STORE VAL ONCE AT END ===
+        # Only store final values to memory after all rounds complete
+        self.add_bundle({
+            "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
         })
 
 BASELINE = 147734
