@@ -191,21 +191,22 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Load ALL tree nodes into cache using vload with 8 parallel pointers
-        # 2047 nodes / 8 = 256 vloads, but with 8 load slots = 32 cycles
-        n_cache_slots = 8
+        # Load ALL tree nodes into cache using vload with 32 parallel pointers
+        # 2047 nodes / 32 ≈ 64 nodes per pointer = 8 vloads each, all in parallel = 8 cycles
+        n_cache_slots = 32
         cache_ptr = [self.alloc_scratch(f"cache_ptr_{i}") for i in range(n_cache_slots)]
         cache_stride = (n_nodes + n_cache_slots - 1) // n_cache_slots  # Nodes per slot
         cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN  # Round up to VLEN
-        cache_stride_const = self.scratch_const(cache_stride, "cache_stride")
         eight_const = self.scratch_const(8, "eight")
 
-        # Initialize pointers: ptr[i] = forest_p + i * cache_stride
-        for i in range(n_cache_slots):
-            offset = self.scratch_const(i * cache_stride, f"cache_offset_{i}")
-            self.add("alu", ("+", cache_ptr[i], self.scratch["forest_values_p"], offset))
+        # Initialize pointers: ptr[i] = forest_p + i * cache_stride (32 ALU ops, 1 cycle)
+        self.add_bundle({
+            "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"],
+                    self.scratch_const(i * cache_stride, f"cache_offset_{i}"))
+                   for i in range(n_cache_slots)],
+        })
 
-        # Load in parallel: each cycle loads 8 vectors (one from each pointer)
+        # Load in parallel: each cycle loads 32 vectors (one from each pointer)
         for chunk in range(0, cache_stride, VLEN):
             load_ops = []
             alu_ops = []
@@ -221,32 +222,21 @@ class KernelBuilder:
                 self.add_bundle(bundle)
 
         # === PRECOMPUTE BASE ADDRESSES (only once, before round loop) ===
-        # Base addresses don't change between rounds, so compute them once
-        # Cycle 1: compute idx_base[0-15]
+        # With 32 ALU slots, compute all bases faster
+        # Cycle 1: compute ALL idx_base[0-31] (32 ALU ops)
         self.add_bundle({
-            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(16)],
+            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
         })
-        # Cycle 2: compute idx_base[16-31]
+        # Cycle 2: compute ALL val_base[0-31] + init round counter (32 ALU + 1 load)
         self.add_bundle({
-            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(16, UNROLL)],
-        })
-        # Cycle 3: compute val_base[0-15]
-        self.add_bundle({
-            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(16)],
-        })
-        # Cycle 4: compute val_base[16-31] + init round counter
-        self.add_bundle({
-            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(16, UNROLL)],
+            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
             "load": [("const", round_counter, 0)],
         })
 
-        # === ROUND 0 ONLY: Load idx before loop (2 cycles) ===
+        # === ROUND 0 ONLY: Load idx before loop (1 cycle with 32 load slots) ===
         # Subsequent rounds load idx in store phase of previous round
         self.add_bundle({
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
-        })
-        self.add_bundle({
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16, UNROLL)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
 
         round_loop_start = len(self.instrs)
