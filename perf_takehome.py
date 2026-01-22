@@ -253,18 +253,15 @@ class KernelBuilder:
             "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
         })
 
-        # === XOR + HASH PHASE ===
-        xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(UNROLL)]
-        self.add_bundle({"valu": xor_ops})
-
+        # === XOR + HASH PHASE (COMBINED) ===
         # Hash all elements (6 stages) - FULLY OPTIMIZED
-        # All stages now use single-cycle custom instructions:
-        # Stages 0, 2, 4: multiply_add (val*k + c)
+        # Stage 0 now combined with XOR: xor_multiply_add((val ^ node_val) * 4097 + c)
+        # Stages 2, 4: multiply_add (val*k + c)
         # Stages 1, 5: xor_rshift_xor (val ^ c ^ (val >> k))
         # Stage 3: add_lshift_xor ((val + c) ^ (val << k))
 
-        # Stage 0: val = val*4097 + c1
-        ops = [("multiply_add", v_val[i], v_val[i], v_mul_4097, hash_consts[0][0]) for i in range(UNROLL)]
+        # Stage 0: val = (val ^ node_val) * 4097 + c1 (combines XOR with hash stage 0)
+        ops = [("xor_multiply_add", v_val[i], v_val[i], v_node_val[i], v_mul_4097, hash_consts[0][0]) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
         # Stage 1: val = (val ^ c1) ^ (val >> 19) = val ^ c1 ^ (val >> 19)
@@ -296,11 +293,14 @@ class KernelBuilder:
         # === STORE PHASE (with 16 store/load slots) ===
         # With 16 slots, we can do all 16 idx stores in 1 cycle, all 16 val stores in 1 cycle
         # And all 16 idx loads in 1 cycle, with pointer updates overlapped
+        # Move batch counter increment to cycle 1 to free up flow slot for cond_jump in cycle 3
 
-        # Cycle 1: store all idx[0-15] + compare (16 stores + 1 ALU)
+        # Cycle 1: store all idx[0-15] + compare + increment (16 stores + 2 ALU)
+        # With write-at-end, compare reads old batch_counter value before increment writes
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(UNROLL)],
-            "alu": [("<", loop_cond, batch_counter, n_vec_iters_m1_const)],
+            "alu": [("<", loop_cond, batch_counter, n_vec_iters_m1_const),
+                    ("+", batch_counter, batch_counter, one_const)],
         })
 
         # Cycle 2: store all val[0-15] + update all idx_base[0-15] (16 stores + 16 ALU)
@@ -309,15 +309,12 @@ class KernelBuilder:
             "alu": [("+", idx_base[i], idx_base[i], stride_const) for i in range(UNROLL)],
         })
 
-        # Cycle 3: update all val_base[0-15] + load all idx[0-15] + increment counter (16 ALU + 16 loads + 1 flow)
+        # Cycle 3: update all val_base[0-15] + load all idx[0-15] + cond_jump (16 ALU + 16 loads + 1 flow)
         self.add_bundle({
             "alu": [("+", val_base[i], val_base[i], stride_const) for i in range(UNROLL)],
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
-            "flow": [("add_imm", batch_counter, batch_counter, 1)],
+            "flow": [("cond_jump", loop_cond, batch_loop_start)],
         })
-
-        # Cycle 4: cond_jump
-        self.add("flow", ("cond_jump", loop_cond, batch_loop_start))
 
         # Round loop control - ALL rounds use cache (full tree is cached)
         self.add("flow", ("add_imm", round_counter, round_counter, 1))

@@ -260,6 +260,15 @@ class Machine:
                 for i in range(VLEN):
                     mul = (core.scratch[a + i] * core.scratch[b + i]) % (2**32)
                     self.scratch_write[dest + i] = (mul + core.scratch[c + i]) % (2**32)
+            case ("xor_multiply_add", dest, val, xor_val, mul_const, add_const):
+                # dest = (val ^ xor_val) * mul_const + add_const
+                # Combines XOR with hash stage 0
+                for i in range(VLEN):
+                    v = core.scratch[val + i]
+                    x = core.scratch[xor_val + i]
+                    m = core.scratch[mul_const + i]
+                    a_val = core.scratch[add_const + i]
+                    self.scratch_write[dest + i] = (((v ^ x) * m) + a_val) % (2**32)
             case ("xor_rshift_xor", dest, val, c, shift_amt):
                 # dest = val ^ c ^ (val >> shift_amt)
                 # Used for hash stages 1, 5: (val ^ c) ^ (val >> k)
