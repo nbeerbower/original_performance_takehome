@@ -107,6 +107,7 @@ class KernelBuilder:
         mul_0_c = self.alloc_scratch("mul_0_c")  # 4097
         mul_2_c = self.alloc_scratch("mul_2_c")  # 33
         mul_4_c = self.alloc_scratch("mul_4_c")  # 9
+        five_c = self.alloc_scratch("five_c")  # 5
 
         hash_c = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -118,6 +119,21 @@ class KernelBuilder:
         chunk_i = self.alloc_scratch("chunk_i")
         cond = self.alloc_scratch("cond")
 
+        # Cached tree values for rounds 1-2
+        tree1_c = self.alloc_scratch("tree1_c")  # scalar cache
+        tree2_c = self.alloc_scratch("tree2_c")
+        tree3_c = self.alloc_scratch("tree3_c")
+        tree4_c = self.alloc_scratch("tree4_c")
+        tree5_c = self.alloc_scratch("tree5_c")
+        tree6_c = self.alloc_scratch("tree6_c")
+        v_tree1 = self.alloc_scratch("v_tree1", VLEN)  # broadcast versions
+        v_tree2 = self.alloc_scratch("v_tree2", VLEN)
+        v_tree3 = self.alloc_scratch("v_tree3", VLEN)
+        v_tree4 = self.alloc_scratch("v_tree4", VLEN)
+        v_tree5 = self.alloc_scratch("v_tree5", VLEN)
+        v_tree6 = self.alloc_scratch("v_tree6", VLEN)
+        v_five = self.alloc_scratch("v_five", VLEN)  # constant 5 for round 2
+
         # =========================================================
         # SETUP: Load constants (batch 2 per cycle)
         # =========================================================
@@ -126,6 +142,7 @@ class KernelBuilder:
         self.add_bundle({"load": [("const", two_c, 2), ("const", vlen_c, VLEN)]})
         self.add_bundle({"load": [("const", n_chunks_c, n_chunks), ("const", mul_0_c, 4097)]})
         self.add_bundle({"load": [("const", mul_2_c, 33), ("const", mul_4_c, 9)]})
+        self.add_bundle({"load": [("const", five_c, 5)]})
 
         for c1, c3, val1, val3 in hash_c:
             self.add_bundle({"load": [("const", c1, val1), ("const", c3, val3)]})
@@ -157,6 +174,36 @@ class KernelBuilder:
                 vops.extend([("vbroadcast", v_c1, c1), ("vbroadcast", v_c3, c3)])
             self.add_bundle({"valu": vops})
 
+        # Cache tree[1-6] for rounds 1-2 optimization
+        # Round 1: indices are 1 or 2
+        # Round 2: indices are 3, 4, 5, or 6
+        self.add_bundle({"alu": [
+            ("+", tmp[4], self.scratch["forest_values_p"], one_c),  # addr of tree[1]
+            ("+", tmp[5], self.scratch["forest_values_p"], two_c),  # addr of tree[2]
+        ]})
+        self.add_bundle({"load": [("load", tree1_c, tmp[4]), ("load", tree2_c, tmp[5])]})
+        # Load tree[3-6] - compute addresses for 3,4,5,6
+        self.add_bundle({"load": [("const", tmp[4], 3), ("const", tmp[5], 4)]})
+        self.add_bundle({"load": [("const", tmp[6], 5), ("const", tmp[7], 6)]})
+        self.add_bundle({"alu": [
+            ("+", tmp[4], self.scratch["forest_values_p"], tmp[4]),
+            ("+", tmp[5], self.scratch["forest_values_p"], tmp[5]),
+            ("+", tmp[6], self.scratch["forest_values_p"], tmp[6]),
+            ("+", tmp[7], self.scratch["forest_values_p"], tmp[7]),
+        ]})
+        self.add_bundle({"load": [("load", tree3_c, tmp[4]), ("load", tree4_c, tmp[5])]})
+        self.add_bundle({"load": [("load", tree5_c, tmp[6]), ("load", tree6_c, tmp[7])]})
+        # Broadcast all cached values
+        self.add_bundle({"valu": [
+            ("vbroadcast", v_tree1, tree1_c),
+            ("vbroadcast", v_tree2, tree2_c),
+            ("vbroadcast", v_tree3, tree3_c),
+            ("vbroadcast", v_tree4, tree4_c),
+            ("vbroadcast", v_tree5, tree5_c),
+            ("vbroadcast", v_tree6, tree6_c),
+        ]})
+        self.add_bundle({"valu": [("vbroadcast", v_five, five_c)]})
+
         self.add("flow", ("pause",))
 
         # =========================================================
@@ -164,15 +211,16 @@ class KernelBuilder:
         # Key insight: keep idx/val in scratch, minimize memory traffic
         # =========================================================
 
+        # Initialize chunk counter and compute first chunk's addresses
         self.add_bundle({"load": [("const", chunk_i, 0)]})
-        chunk_loop = len(self.instrs)
-
-        # Load idx and val for this chunk (ONCE per chunk)
         self.add_bundle({"alu": [("*", tmp[0], chunk_i, vlen_c)]})
         self.add_bundle({"alu": [
             ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
             ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
         ]})
+
+        chunk_loop = len(self.instrs)
+        # Load idx and val - addresses already in tmp[0], tmp[1]
         self.add_bundle({"load": [("vload", v_idx, tmp[0]), ("vload", v_val, tmp[1])]})
 
         # FULLY UNROLLED: 16 rounds with idx/val staying in scratch
@@ -185,6 +233,26 @@ class KernelBuilder:
                 # Broadcast to all 8 positions
                 self.add_bundle({"valu": [("vbroadcast", v_node_val, tmp[4])]})
                 # Vector XOR
+                self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
+            elif round_num == 1:
+                # Round 1: all idx are 1 or 2 (children of root, pre-cached)
+                # cond = (idx == 1), then select from cached tree[1] or tree[2]
+                self.add_bundle({"valu": [("==", v_tmp1, v_idx, v_one)]})  # cond: 1 if idx==1, 0 if idx==2
+                self.add_bundle({"flow": [("vselect", v_node_val, v_tmp1, v_tree1, v_tree2)]})
+                self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
+            elif round_num == 2:
+                # Round 2: all idx are 3, 4, 5, or 6 (pre-cached)
+                # Two-level selection: first by (idx < 5), then by (idx & 1)
+                self.add_bundle({"valu": [
+                    ("&", v_tmp1, v_idx, v_one),  # odd_cond: idx & 1
+                    ("<", v_tmp2, v_idx, v_five),  # pair_cond: idx < 5
+                ]})
+                # Select odd values (tree3 or tree5) based on pair
+                self.add_bundle({"flow": [("vselect", v_node_val, v_tmp2, v_tree3, v_tree5)]})
+                # Select even values (tree4 or tree6) based on pair, store in v_tmp2
+                self.add_bundle({"flow": [("vselect", v_tmp2, v_tmp2, v_tree4, v_tree6)]})
+                # Final select based on odd/even
+                self.add_bundle({"flow": [("vselect", v_node_val, v_tmp1, v_node_val, v_tmp2)]})
                 self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
             else:
                 # Gather tree nodes - PIPELINED with XOR overlapped (6 cycles for gather+XOR)
@@ -281,26 +349,51 @@ class KernelBuilder:
 
             # Tree step: idx = idx*2 + 1 + (val & 1), with bounds check
             # Use multiply_add: idx*2 + 1 in one cycle
-            self.add_bundle({"valu": [
-                ("multiply_add", v_idx, v_idx, v_two, v_one),  # idx = idx*2 + 1
-                ("&", v_tmp1, v_val, v_one),  # tmp1 = val & 1
-            ]})
-            self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})  # idx = idx + tmp1
-            self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
-            self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
+            # For last round, overlap store address calc with tree step (alu free during valu)
+            if round_num == rounds - 1:
+                # Last round - overlap store address calc
+                self.add_bundle({
+                    "valu": [
+                        ("multiply_add", v_idx, v_idx, v_two, v_one),
+                        ("&", v_tmp1, v_val, v_one),
+                    ],
+                    "alu": [("*", tmp[0], chunk_i, vlen_c)]  # Start store addr calc
+                })
+                self.add_bundle({
+                    "valu": [("+", v_idx, v_idx, v_tmp1)],
+                    "alu": [
+                        ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
+                        ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
+                    ]
+                })
+                self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
+                self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
+            else:
+                self.add_bundle({"valu": [
+                    ("multiply_add", v_idx, v_idx, v_two, v_one),
+                    ("&", v_tmp1, v_val, v_one),
+                ]})
+                self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})
+                self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
+                self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
 
-        # Store results ONCE after all 16 rounds complete
-        self.add_bundle({"alu": [("*", tmp[0], chunk_i, vlen_c)]})
+        # Store results + increment chunk_i in parallel (store + flow engines)
+        self.add_bundle({
+            "store": [("vstore", tmp[0], v_idx), ("vstore", tmp[1], v_val)],
+            "flow": [("add_imm", chunk_i, chunk_i, 1)]
+        })
+        # Compare + compute next chunk addresses in parallel (both use alu)
         self.add_bundle({"alu": [
-            ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
-            ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
+            ("<", cond, chunk_i, n_chunks_c),
+            ("*", tmp[0], chunk_i, vlen_c),  # Start next addr calc
         ]})
-        self.add_bundle({"store": [("vstore", tmp[0], v_idx), ("vstore", tmp[1], v_val)]})
-
-        # Chunk loop control
-        self.add_bundle({"flow": [("add_imm", chunk_i, chunk_i, 1)]})
-        self.add_bundle({"alu": [("<", cond, chunk_i, n_chunks_c)]})
-        self.add_bundle({"flow": [("cond_jump", cond, chunk_loop)]})
+        self.add_bundle({
+            "alu": [
+                ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
+                ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
+            ],
+            "flow": [("cond_jump", cond, chunk_loop)]
+        })
 
         self.add("flow", ("pause",))
 
