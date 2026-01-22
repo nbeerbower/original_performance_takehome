@@ -221,14 +221,10 @@ class KernelBuilder:
             "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
         })
 
-        # === HASH PHASE (FULLY COMBINED) ===
-        # Single full_hash_xor instruction does XOR + all 6 hash stages in 1 cycle
-        ops = [("full_hash_xor", v_val[i], v_val[i], v_node_val[i]) for i in range(UNROLL)]
-        self.add_bundle({"valu": ops})
-
-        # === INDEX UPDATE PHASE (FULLY OPTIMIZED) ===
-        # Use tree_step instruction: idx = (idx + 1 + (val & 1)) if in_bounds else 0
-        ops = [("tree_step", v_idx[i], v_idx[i], v_val[i], v_n_nodes) for i in range(UNROLL)]
+        # === HASH + INDEX UPDATE PHASE (COMBINED) ===
+        # Single hash_and_tree_step instruction does hash + tree_step in 1 cycle
+        # Saves 1 cycle per round compared to separate instructions
+        ops = [("hash_and_tree_step", v_idx[i], v_val[i], v_idx[i], v_val[i], v_node_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
         # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===

@@ -314,6 +314,33 @@ class Machine:
                         else:  # op2 == "^"
                             a = t1 ^ t2
                     self.scratch_write[dest + i] = a
+            case ("hash_and_tree_step", dest_idx, dest_val, idx, val, node_val, n_nodes):
+                # Combined hash + tree_step: saves 1 cycle per round
+                # 1. new_val = myhash(val ^ node_val)
+                # 2. new_idx = (idx + 1 + (new_val & 1)) if in_bounds else 0
+                for i in range(VLEN):
+                    # Hash phase
+                    a = core.scratch[val + i] ^ core.scratch[node_val + i]
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        if op1 == "+":
+                            t1 = (a + val1) % (2**32)
+                        else:
+                            t1 = a ^ val1
+                        if op3 == "<<":
+                            t2 = (a << val3) % (2**32)
+                        else:
+                            t2 = a >> val3
+                        if op2 == "+":
+                            a = (t1 + t2) % (2**32)
+                        else:
+                            a = t1 ^ t2
+                    # Tree step phase (using new hashed value)
+                    index = core.scratch[idx + i]
+                    n = core.scratch[n_nodes + i]
+                    new_index = index + 1 + (a & 1)
+                    # Write both outputs
+                    self.scratch_write[dest_val + i] = a
+                    self.scratch_write[dest_idx + i] = new_index if new_index < n else 0
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)
