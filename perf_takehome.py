@@ -140,6 +140,14 @@ class KernelBuilder:
             c3 = self.scratch_vconst(val3, f"hash_{hi}_c3")
             hash_consts.append((c1, c3))
 
+        # Multiply constants for optimized hash stages 0, 2, 4
+        # Stage 0: val = val*4097 + c1 (since 1 + 2^12 = 4097)
+        # Stage 2: val = val*33 + c1 (since 1 + 2^5 = 33)
+        # Stage 4: val = val*9 + c1 (since 1 + 2^3 = 9)
+        v_mul_4097 = self.scratch_vconst(4097, "v_mul_4097")
+        v_mul_33 = self.scratch_vconst(33, "v_mul_33")
+        v_mul_9 = self.scratch_vconst(9, "v_mul_9")
+
         # Vector scratch registers for UNROLL lanes
         # Note: v_tmp3 removed - no longer needed since we use arithmetic instead of vselect
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
@@ -345,18 +353,30 @@ class KernelBuilder:
         xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(UNROLL)]
         self.add_bundle({"valu": xor_ops})
 
-        # Hash all elements (6 stages) - with 32 VALU slots
+        # Hash all elements (6 stages) - OPTIMIZED with multiply_add
+        # Stages 0, 2, 4 can use multiply_add: val = val*k + c1 (1 cycle instead of 2)
+        # Stage 0: val = val*4097 + c1, Stage 2: val = val*33 + c1, Stage 4: val = val*9 + c1
+        mul_consts = {0: v_mul_4097, 2: v_mul_33, 4: v_mul_9}
+
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1, c3 = hash_consts[hi]
-            # Compute tmp1 and tmp2 for all 16 elements in 1 cycle (32 ops)
-            hash_ops = []
-            for i in range(UNROLL):
-                hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
-                hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
-            self.add_bundle({"valu": hash_ops})
-            # Combine: all 16 elements in 1 cycle
-            combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(UNROLL)]
-            self.add_bundle({"valu": combine_ops})
+
+            if hi in mul_consts:
+                # Optimized: val = val * mul_const + c1 in ONE cycle using multiply_add
+                mul_const = mul_consts[hi]
+                ops = [("multiply_add", v_val[i], v_val[i], mul_const, c1) for i in range(UNROLL)]
+                self.add_bundle({"valu": ops})
+            else:
+                # Standard 2-cycle approach for stages 1, 3, 5
+                # Cycle 1: tmp1 = op1(val, c1), tmp2 = op3(val, c3)
+                hash_ops = []
+                for i in range(UNROLL):
+                    hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
+                    hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
+                self.add_bundle({"valu": hash_ops})
+                # Cycle 2: val = op2(tmp1, tmp2)
+                combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(UNROLL)]
+                self.add_bundle({"valu": combine_ops})
 
         # === INDEX UPDATE PHASE (OPTIMIZED) ===
         # Compute idx = (idx + 1 + (val & 1)) * (idx + 1 + (val & 1) < n_nodes)
