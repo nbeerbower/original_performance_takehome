@@ -228,9 +228,11 @@ class KernelBuilder:
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
         })
         # Cycle 2: compute ALL val_base[0-31] + init round counter (32 ALU + 1 load)
+        # Note: round_counter starts at 1 because we compare BEFORE incrementing
+        # (compare counter < rounds, then increment + jump in same cycle)
         self.add_bundle({
             "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
-            "load": [("const", round_counter, 0)],
+            "load": [("const", round_counter, 1)],
         })
 
         # === ROUND 0 ONLY: Load idx before loop (1 cycle with 32 load slots) ===
@@ -259,22 +261,24 @@ class KernelBuilder:
         self.add_bundle({"valu": ops})
 
         # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===
-        # With 32 store/load slots, can do all 32 stores per cycle
+        # With flow=2, can combine increment + cond_jump in same cycle
+        # Key insight: compare BEFORE increment, then increment + cond_jump together
+        # This requires starting round_counter at 1 (not 0)
 
-        # Cycle 1: store ALL idx[0-31] + increment round_counter (32 stores + 1 flow)
+        # Cycle 1: store ALL idx[0-31] + compare (32 stores + 1 ALU)
+        # Compare reads round_counter before it's incremented
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(UNROLL)],
-            "flow": [("add_imm", round_counter, round_counter, 1)],
+            "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
         })
-        # Cycle 2: store ALL val[0-31] + compare + load ALL idx[0-31] for next round
-        # idx was stored in cycle 1, now available for loading
+        # Cycle 2: store ALL val[0-31] + load ALL idx[0-31] + increment + cond_jump
+        # cond_jump reads loop_cond from cycle 1, increment + jump both use flow slots
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
-            "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
+            "flow": [("add_imm", round_counter, round_counter, 1),
+                     ("cond_jump", loop_cond, round_loop_start)],
         })
-        # Cycle 3: cond_jump
-        self.add("flow", ("cond_jump", loop_cond, round_loop_start))
 
         self.instrs.append({"flow": [("pause",)]})
 
