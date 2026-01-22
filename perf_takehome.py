@@ -122,8 +122,8 @@ class KernelBuilder:
         # Offset constants for base address computation
         offset_consts = [alloc_scalar(u * VLEN, f"offset_{u}") for u in range(UNROLL)]
 
-        # Cache stride offsets (n_cache_slots = 32)
-        n_cache_slots = 32
+        # Cache stride offsets (n_cache_slots = 64 for 64-way parallel loading)
+        n_cache_slots = 64
         cache_stride = (n_nodes + n_cache_slots - 1) // n_cache_slots
         cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN
         cache_offset_consts = [alloc_scalar(i * cache_stride, f"cache_offset_{i}") for i in range(n_cache_slots)]
@@ -141,7 +141,7 @@ class KernelBuilder:
         round_counter = self.alloc_scratch("round_counter")
         loop_cond = self.alloc_scratch("loop_cond")
 
-        # Cache pointers
+        # Cache pointers (64 for 64-way parallel loading)
         cache_ptr = [self.alloc_scratch(f"cache_ptr_{i}") for i in range(n_cache_slots)]
 
         # Tree cache (full tree)
@@ -174,22 +174,26 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         # =========================================================
-        # PHASE 3: VECTOR BROADCASTS + CACHE LOADING (overlapped with base addr computation)
+        # PHASE 3: VECTOR BROADCASTS + CACHE LOADING (64-way parallel)
         # =========================================================
 
-        # Broadcast + cache ptr init + idx_base (all in one cycle with 64 ALU slots)
+        # Compute base addresses first (both idx_base and val_base together = 64 ALU)
+        self.add_bundle({
+            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)] +
+                   [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
+        })
+
+        # Broadcast + cache ptr init (valu:2 + alu:64 for 64 cache pointers)
         self.add_bundle({
             "valu": [
                 ("vbroadcast", v_two, two_const),
                 ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
             ],
             "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i])
-                   for i in range(n_cache_slots)] +
-                   [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
+                   for i in range(n_cache_slots)],
         })
 
-        # First cache load cycle also computes val_base (64 ALU: 32 ptr update + 32 val_base)
-        first_chunk = True
+        # 64-way parallel cache loading: 64 loads + 64 ptr updates per cycle
         for chunk in range(0, cache_stride, VLEN):
             load_ops = []
             alu_ops = []
@@ -200,10 +204,6 @@ class KernelBuilder:
                     alu_ops.append(("+", cache_ptr[i], cache_ptr[i], eight_const))
             if load_ops:
                 bundle = {"load": load_ops}
-                if first_chunk:
-                    # Add val_base computation to first cache load cycle
-                    alu_ops += [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)]
-                    first_chunk = False
                 if alu_ops:
                     bundle["alu"] = alu_ops
                 self.add_bundle(bundle)
