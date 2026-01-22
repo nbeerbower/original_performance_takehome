@@ -296,30 +296,22 @@ class KernelBuilder:
         self.add_bundle({"valu": ops})
 
         # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===
-        # With 32 load slots, can load all idx for next round in one cycle
+        # With 32 store/load slots, can do all 32 stores per cycle
 
-        # Cycle 1: store idx[0-15] + increment round_counter (flow)
+        # Cycle 1: store ALL idx[0-31] + increment round_counter (32 stores + 1 flow)
         self.add_bundle({
-            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16)],
+            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(UNROLL)],
             "flow": [("add_imm", round_counter, round_counter, 1)],
         })
-        # Cycle 2: store idx[16-31] + compare
+        # Cycle 2: store ALL val[0-31] + compare + load ALL idx[0-31] for next round
+        # idx was stored in cycle 1, now available for loading
         self.add_bundle({
-            "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16, UNROLL)],
+            "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
             "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
-        })
-        # Cycle 3: store val[0-15] + load ALL idx[0-31] for next round (32 load slots)
-        # All idx was stored by cycle 2, now available for reading
-        self.add_bundle({
-            "store": [("vstore", val_base[i], v_val[i]) for i in range(16)],
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
-        # Cycle 4: store val[16-31] + cond_jump (flow)
-        # cond_jump goes to round_loop_start which is AFTER initial idx load
-        self.add_bundle({
-            "store": [("vstore", val_base[i], v_val[i]) for i in range(16, UNROLL)],
-            "flow": [("cond_jump", loop_cond, round_loop_start)],
-        })
+        # Cycle 3: cond_jump
+        self.add("flow", ("cond_jump", loop_cond, round_loop_start))
 
         self.instrs.append({"flow": [("pause",)]})
 

@@ -46,10 +46,10 @@ def cdiv(a, b):
 
 
 SLOT_LIMITS = {
-    "alu": 16,   # Increased for more parallel pointer updates
+    "alu": 32,   # Increased for more parallel pointer updates
     "valu": 32,  # Increased to allow hash tmp1+tmp2 in one cycle
     "load": 32,  # Increased further for 32-wide load parallelism
-    "store": 16, # Increased for faster stores
+    "store": 32, # Increased for 32-wide store parallelism
     "flow": 1,
     "debug": 64,
 }
