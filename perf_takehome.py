@@ -177,13 +177,16 @@ class KernelBuilder:
         # PHASE 3: VECTOR BROADCASTS + CACHE LOADING (64-way parallel)
         # =========================================================
 
-        # Compute base addresses first (both idx_base and val_base together = 64 ALU)
+        # Compute base addresses + init round counter (alu:64 + load:1)
+        # round_counter starts at 1 because we compare BEFORE incrementing
         self.add_bundle({
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)] +
                    [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
+            "load": [("const", round_counter, 1)],
         })
 
-        # Broadcast + cache ptr init (valu:2 + alu:64 for 64 cache pointers)
+        # Broadcast + cache ptr init + initial idx load (valu:2 + alu:64 + load:32)
+        # idx_base was computed in previous cycle, can read now
         self.add_bundle({
             "valu": [
                 ("vbroadcast", v_two, two_const),
@@ -191,6 +194,7 @@ class KernelBuilder:
             ],
             "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i])
                    for i in range(n_cache_slots)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
 
         # 64-way parallel cache loading: 64 loads + 64 ptr updates per cycle
@@ -207,16 +211,6 @@ class KernelBuilder:
                 if alu_ops:
                     bundle["alu"] = alu_ops
                 self.add_bundle(bundle)
-
-        # =========================================================
-        # PHASE 4: ROUND LOOP SETUP
-        # =========================================================
-
-        # Load initial idx + init round counter (idx_base computed earlier, can read now)
-        # round_counter starts at 1 because we compare BEFORE incrementing
-        self.add_bundle({
-            "load": [("const", round_counter, 1)] + [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
-        })
 
         round_loop_start = len(self.instrs)
 
