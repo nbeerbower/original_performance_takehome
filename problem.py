@@ -46,18 +46,18 @@ def cdiv(a, b):
 
 
 SLOT_LIMITS = {
-    "alu": 320,  # Increased for 256-way cache ptr + 64 base addr in same cycle
-    "valu": 64,  # Increased to merge idx*2 with hash_and_tree_step
-    "load": 320, # Increased for 256 cache + 32 idx + 32 val loads in setup
-    "store": 64, # Increased for 64-wide store parallelism (store idx + val together)
-    "flow": 2,   # Allow increment + cond_jump overlap
+    "alu": 12,
+    "valu": 6,
+    "load": 2,
+    "store": 2,
+    "flow": 1,
     "debug": 64,
 }
 
 VLEN = 8
 # Older versions of the take-home used multiple cores, but this version only uses 1
 N_CORES = 1
-SCRATCH_SIZE = 4096  # Increased to allow full tree caching
+SCRATCH_SIZE = 1536
 BASE_ADDR_TID = 100000
 
 
@@ -260,186 +260,6 @@ class Machine:
                 for i in range(VLEN):
                     mul = (core.scratch[a + i] * core.scratch[b + i]) % (2**32)
                     self.scratch_write[dest + i] = (mul + core.scratch[c + i]) % (2**32)
-            case ("xor_multiply_add", dest, val, xor_val, mul_const, add_const):
-                # dest = (val ^ xor_val) * mul_const + add_const
-                # Combines XOR with hash stage 0
-                for i in range(VLEN):
-                    v = core.scratch[val + i]
-                    x = core.scratch[xor_val + i]
-                    m = core.scratch[mul_const + i]
-                    a_val = core.scratch[add_const + i]
-                    self.scratch_write[dest + i] = (((v ^ x) * m) + a_val) % (2**32)
-            case ("xor_rshift_xor", dest, val, c, shift_amt):
-                # dest = val ^ c ^ (val >> shift_amt)
-                # Used for hash stages 1, 5: (val ^ c) ^ (val >> k)
-                for i in range(VLEN):
-                    v = core.scratch[val + i]
-                    cv = core.scratch[c + i]
-                    sh = core.scratch[shift_amt + i]
-                    self.scratch_write[dest + i] = (v ^ cv ^ (v >> sh)) % (2**32)
-            case ("add_lshift_xor", dest, val, c, shift_amt):
-                # dest = (val + c) ^ (val << shift_amt)
-                # Used for hash stage 3
-                for i in range(VLEN):
-                    v = core.scratch[val + i]
-                    cv = core.scratch[c + i]
-                    sh = core.scratch[shift_amt + i]
-                    self.scratch_write[dest + i] = ((v + cv) ^ (v << sh)) % (2**32)
-            case ("tree_step", dest, idx, val, n_nodes):
-                # Combined tree traversal step: dest = (idx + 1 + (val & 1)) if in bounds else 0
-                # idx is already idx*2 from earlier, so this computes the child index
-                for i in range(VLEN):
-                    index = core.scratch[idx + i]
-                    v = core.scratch[val + i]
-                    n = core.scratch[n_nodes + i]
-                    new_index = index + 1 + (v & 1)
-                    self.scratch_write[dest + i] = new_index if new_index < n else 0
-            case ("full_hash_xor", dest, val, node_val):
-                # Combined XOR + all 6 hash stages in one instruction
-                # val = myhash(val ^ node_val)
-                for i in range(VLEN):
-                    a = core.scratch[val + i] ^ core.scratch[node_val + i]
-                    # Apply all 6 hash stages
-                    for op1, val1, op2, op3, val3 in HASH_STAGES:
-                        if op1 == "+":
-                            t1 = (a + val1) % (2**32)
-                        else:  # op1 == "^"
-                            t1 = a ^ val1
-                        if op3 == "<<":
-                            t2 = (a << val3) % (2**32)
-                        else:  # op3 == ">>"
-                            t2 = a >> val3
-                        if op2 == "+":
-                            a = (t1 + t2) % (2**32)
-                        else:  # op2 == "^"
-                            a = t1 ^ t2
-                    self.scratch_write[dest + i] = a
-            case ("hash_and_tree_step", dest_idx, dest_val, idx, val, node_val, n_nodes):
-                # Combined hash + tree_step: saves 1 cycle per round
-                # 1. new_val = myhash(val ^ node_val)
-                # 2. new_idx = (idx + 1 + (new_val & 1)) if in_bounds else 0
-                for i in range(VLEN):
-                    # Hash phase
-                    a = core.scratch[val + i] ^ core.scratch[node_val + i]
-                    for op1, val1, op2, op3, val3 in HASH_STAGES:
-                        if op1 == "+":
-                            t1 = (a + val1) % (2**32)
-                        else:
-                            t1 = a ^ val1
-                        if op3 == "<<":
-                            t2 = (a << val3) % (2**32)
-                        else:
-                            t2 = a >> val3
-                        if op2 == "+":
-                            a = (t1 + t2) % (2**32)
-                        else:
-                            a = t1 ^ t2
-                    # Tree step phase (using new hashed value)
-                    index = core.scratch[idx + i]
-                    n = core.scratch[n_nodes + i]
-                    new_index = index + 1 + (a & 1)
-                    # Write both outputs
-                    self.scratch_write[dest_val + i] = a
-                    self.scratch_write[dest_idx + i] = new_index if new_index < n else 0
-            case ("hash_and_tree_step_with_mul", dest_idx, dest_val, idx, val, node_val, n_nodes):
-                # Combined idx*2 + hash + tree_step: saves 2 cycles per round
-                # 1. idx = idx * 2  (for tree array indexing)
-                # 2. new_val = myhash(val ^ node_val)
-                # 3. new_idx = (idx*2 + 1 + (new_val & 1)) if in_bounds else 0
-                for i in range(VLEN):
-                    # Hash phase
-                    a = core.scratch[val + i] ^ core.scratch[node_val + i]
-                    for op1, val1, op2, op3, val3 in HASH_STAGES:
-                        if op1 == "+":
-                            t1 = (a + val1) % (2**32)
-                        else:
-                            t1 = a ^ val1
-                        if op3 == "<<":
-                            t2 = (a << val3) % (2**32)
-                        else:
-                            t2 = a >> val3
-                        if op2 == "+":
-                            a = (t1 + t2) % (2**32)
-                        else:
-                            a = t1 ^ t2
-                    # Tree step phase with idx*2 built-in
-                    index = core.scratch[idx + i] * 2  # idx*2 built into instruction
-                    n = core.scratch[n_nodes + i]
-                    new_index = index + 1 + (a & 1)
-                    # Write both outputs
-                    self.scratch_write[dest_val + i] = a
-                    self.scratch_write[dest_idx + i] = new_index if new_index < n else 0
-            case ("gather_hash_step", dest_idx, dest_val, idx, val, cache_base, cache_size, n_nodes):
-                # Ultimate combined instruction: gather + idx*2 + hash + tree_step
-                # Does gather INTERNALLY (not via scratch_write) to avoid 1-cycle dependency
-                # n_nodes can be a scratch address (vector) or immediate constant (scalar)
-                # 1. node_val = gather(cache_base, idx)  (internal, not written to scratch)
-                # 2. new_val = myhash(val ^ node_val)
-                # 3. new_idx = ((idx*2) + 1 + (new_val & 1)) if in_bounds else 0
-                for i in range(VLEN):
-                    # Gather phase (INTERNAL - read directly, don't use scratch_write)
-                    tree_idx = core.scratch[idx + i]
-                    clamped_idx = min(tree_idx, cache_size - 1)
-                    node_val = core.scratch[cache_base + clamped_idx]  # Direct read
-
-                    # Hash phase (using gathered value immediately)
-                    a = core.scratch[val + i] ^ node_val
-                    for op1, val1, op2, op3, val3 in HASH_STAGES:
-                        if op1 == "+":
-                            t1 = (a + val1) % (2**32)
-                        else:
-                            t1 = a ^ val1
-                        if op3 == "<<":
-                            t2 = (a << val3) % (2**32)
-                        else:
-                            t2 = a >> val3
-                        if op2 == "+":
-                            a = (t1 + t2) % (2**32)
-                        else:
-                            a = t1 ^ t2
-
-                    # Tree step phase with idx*2 built-in
-                    new_tree_idx = tree_idx * 2 + 1 + (a & 1)
-                    # n_nodes can be immediate (int) or scratch address
-                    n = n_nodes if isinstance(n_nodes, int) else core.scratch[n_nodes + i]
-
-                    # Write outputs
-                    self.scratch_write[dest_val + i] = a
-                    self.scratch_write[dest_idx + i] = new_tree_idx if new_tree_idx < n else 0
-            case ("gather_hash_step_store", dest_idx, dest_val, idx, val, cache_base, cache_size, n_nodes, mem_addr):
-                # Final round variant: same as gather_hash_step but ALSO stores val to memory
-                # Combines round + store into single cycle
-                for i in range(VLEN):
-                    # Gather phase (INTERNAL - read directly, don't use scratch_write)
-                    tree_idx = core.scratch[idx + i]
-                    clamped_idx = min(tree_idx, cache_size - 1)
-                    node_val = core.scratch[cache_base + clamped_idx]  # Direct read
-
-                    # Hash phase (using gathered value immediately)
-                    a = core.scratch[val + i] ^ node_val
-                    for op1, val1, op2, op3, val3 in HASH_STAGES:
-                        if op1 == "+":
-                            t1 = (a + val1) % (2**32)
-                        else:
-                            t1 = a ^ val1
-                        if op3 == "<<":
-                            t2 = (a << val3) % (2**32)
-                        else:
-                            t2 = a >> val3
-                        if op2 == "+":
-                            a = (t1 + t2) % (2**32)
-                        else:
-                            a = t1 ^ t2
-
-                    # Tree step phase with idx*2 built-in
-                    new_tree_idx = tree_idx * 2 + 1 + (a & 1)
-                    n = n_nodes if isinstance(n_nodes, int) else core.scratch[n_nodes + i]
-
-                    # Write to scratch (for consistency, though idx won't be used after)
-                    self.scratch_write[dest_val + i] = a
-                    self.scratch_write[dest_idx + i] = new_tree_idx if new_tree_idx < n else 0
-                    # ALSO write val directly to memory - combining store with final round
-                    self.mem_write[mem_addr + i] = a
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)
@@ -456,27 +276,12 @@ class Machine:
                 self.scratch_write[dest + offset] = self.mem[
                     core.scratch[addr + offset]
                 ]
-            case ("vload", dest, addr):  # addr is a scalar scratch address
+            case ("vload", dest, addr):  # addr is a scalar
                 addr = core.scratch[addr]
                 for vi in range(VLEN):
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
-            case ("vload_imm", dest, imm_addr):  # addr is immediate constant
-                for vi in range(VLEN):
-                    self.scratch_write[dest + vi] = self.mem[imm_addr + vi]
             case ("const", dest, val):
                 self.scratch_write[dest] = (val) % (2**32)
-            case ("scratch_gather", dest, v_idx, base, size):
-                # Gather from scratch memory: v_dest[i] = scratch[base + v_idx[i]]
-                # Enables efficient caching by loading from scratch based on computed indices
-                # Size parameter: indices are clamped to [0, size-1] to handle out-of-bounds
-                for vi in range(VLEN):
-                    idx = core.scratch[v_idx + vi]
-                    idx = min(idx, size - 1)  # Clamp to valid range
-                    self.scratch_write[dest + vi] = core.scratch[base + idx]
-            case ("scratch_vload", dest, base):
-                # Load contiguous scratch values to vector: v_dest[i] = scratch[base + i]
-                for vi in range(VLEN):
-                    self.scratch_write[dest + vi] = core.scratch[base + vi]
             case _:
                 raise NotImplementedError(f"Unknown load op {slot}")
 
@@ -485,13 +290,10 @@ class Machine:
             case ("store", addr, src):
                 addr = core.scratch[addr]
                 self.mem_write[addr] = core.scratch[src]
-            case ("vstore", addr, src):  # addr is a scalar scratch address
+            case ("vstore", addr, src):  # addr is a scalar
                 addr = core.scratch[addr]
                 for vi in range(VLEN):
                     self.mem_write[addr + vi] = core.scratch[src + vi]
-            case ("vstore_imm", imm_addr, src):  # addr is immediate constant
-                for vi in range(VLEN):
-                    self.mem_write[imm_addr + vi] = core.scratch[src + vi]
             case _:
                 raise NotImplementedError(f"Unknown store op {slot}")
 

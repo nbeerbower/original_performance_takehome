@@ -1,19 +1,5 @@
 """
 # Anthropic's Original Performance Engineering Take-home (Release version)
-
-Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
-to publish or redistribute your solutions so it's hard to find spoilers.
-
-# Task
-
-- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
-  available time, as measured by test_kernel_cycles on a frozen separate copy
-  of the simulator.
-
-Validate your results using `python tests/submission_tests.py` without modifying
-anything in the tests/ folder.
-
-We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
@@ -44,7 +30,6 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
-        self.vconst_map = {}  # For vector constants
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -53,7 +38,6 @@ class KernelBuilder:
         self.instrs.append({engine: [slot]})
 
     def add_bundle(self, bundle: dict):
-        """Add a pre-formed instruction bundle (for VLIW packing)"""
         self.instrs.append(bundle)
 
     def alloc_scratch(self, name=None, length=1):
@@ -65,100 +49,183 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
-            self.const_map[val] = addr
-        return self.const_map[val]
-
-    def scratch_vconst(self, val, name=None):
-        """Allocate a vector constant (broadcast scalar to VLEN elements)"""
-        if val not in self.vconst_map:
-            scalar_addr = self.scratch_const(val)
-            addr = self.alloc_scratch(name, VLEN)
-            self.add("valu", ("vbroadcast", addr, scalar_addr))
-            self.vconst_map[val] = addr
-        return self.vconst_map[val]
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized kernel with:
-        1. Vectorization (VLEN=8) - process 8 elements per operation
-        2. VLIW packing - multiple operations per cycle
-        3. Fully unrolled rounds (no loop overhead)
-        4. Hardcoded constants for known fixed parameters
-        5. UNROLL=32 - process all 256 elements in single batch iteration
+        Optimized kernel within real constraints:
+        load:2, valu:6, alu:12, store:2, flow:1
         """
-        UNROLL = 32  # Process 32 vector chunks = 256 elements (full batch)
+        n_chunks = batch_size // VLEN  # 32 chunks
 
         # =========================================================
-        # HARDCODED CONSTANTS (fixed for test: height=10, batch=256)
-        # =========================================================
-        # Memory layout: [header(7)] [tree(2047)] [indices(256)] [values(256)]
-        FOREST_VALUES_P = 7  # Header size
-        N_NODES = 2047       # 2^11 - 1 for height=10
-        INP_INDICES_P = FOREST_VALUES_P + N_NODES  # 2054
-        INP_VALUES_P = INP_INDICES_P + batch_size   # 2310
-
-        # =========================================================
-        # PHASE 1: ALLOCATE SCRATCH MEMORY ONLY (no constants needed!)
+        # PHASE 1: ALLOCATE ALL SCRATCH FIRST
         # =========================================================
 
-        # Vector registers - allocate scratch space
-        v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
-        v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
+        # Header variables
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
+                     "forest_values_p", "inp_indices_p", "inp_values_p"]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
 
-        # Tree cache (full tree)
-        CACHE_SIZE = N_NODES
-        tree_cache = self.alloc_scratch("tree_cache", CACHE_SIZE)
+        # Scalar temps
+        tmp = [self.alloc_scratch(f"tmp{i}") for i in range(8)]
 
-        # Cache parameters
-        n_cache_slots = 256
-        cache_stride = (N_NODES + n_cache_slots - 1) // n_cache_slots
-        cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN
+        # Vector registers
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+
+        # Vector constants
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+
+        # Hash stage vector constants
+        v_hash = []
+        for hi in range(len(HASH_STAGES)):
+            v_c1 = self.alloc_scratch(f"v_hc1_{hi}", VLEN)
+            v_c3 = self.alloc_scratch(f"v_hc3_{hi}", VLEN)
+            v_hash.append((v_c1, v_c3))
+
+        # Scalar constants
+        zero_c = self.alloc_scratch("zero_c")
+        one_c = self.alloc_scratch("one_c")
+        two_c = self.alloc_scratch("two_c")
+        vlen_c = self.alloc_scratch("vlen_c")
+        n_chunks_c = self.alloc_scratch("n_chunks_c")
+        rounds_c = self.alloc_scratch("rounds_c")
+
+        # Hash scalar constants
+        hash_c = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.alloc_scratch(f"hc1_{hi}")
+            c3 = self.alloc_scratch(f"hc3_{hi}")
+            hash_c.append((c1, c3, val1, val3))
+
+        # Loop control
+        chunk_i = self.alloc_scratch("chunk_i")
+        round_i = self.alloc_scratch("round_i")
+        cond = self.alloc_scratch("cond")
 
         # =========================================================
-        # PHASE 2: LOAD DATA + CACHE (single cycle with vload_imm!)
+        # PHASE 2: LOAD CONSTANTS
         # =========================================================
-        # Using vload_imm with immediate addresses - NO CONSTANTS NEEDED!
-        cache_load_ops = []
-        for i in range(n_cache_slots):
-            dest_offset = i * cache_stride
-            if dest_offset < N_NODES:
-                cache_load_ops.append(("vload_imm", tree_cache + dest_offset, FOREST_VALUES_P + i * cache_stride))
 
-        self.add_bundle({
-            "load": [("vload_imm", v_idx[i], INP_INDICES_P + i * VLEN) for i in range(UNROLL)] +
-                    [("vload_imm", v_val[i], INP_VALUES_P + i * VLEN) for i in range(UNROLL)] +
-                    cache_load_ops,
-        })
+        # Load basic scalar constants (2 per cycle)
+        self.add_bundle({"load": [("const", zero_c, 0), ("const", one_c, 1)]})
+        self.add_bundle({"load": [("const", two_c, 2), ("const", vlen_c, VLEN)]})
+        self.add_bundle({"load": [("const", n_chunks_c, n_chunks), ("const", rounds_c, rounds)]})
 
-        # === FULLY UNROLLED ROUNDS ===
-        # With 16 fixed rounds, unroll completely to avoid loop overhead
-        # Rounds 1-15: gather_hash_step
-        # Round 16: gather_hash_step_store (combines final round + store)
-        for round_num in range(rounds - 1):
-            self.add_bundle({
-                "valu": [("gather_hash_step", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, N_NODES) for i in range(UNROLL)],
-            })
+        # Load hash constants
+        for hi, (c1, c3, val1, val3) in enumerate(hash_c):
+            self.add_bundle({"load": [("const", c1, val1), ("const", c3, val3)]})
 
-        # Final round + store combined
-        self.add_bundle({
-            "valu": [("gather_hash_step_store", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, N_NODES, INP_VALUES_P + i * VLEN) for i in range(UNROLL)],
-        })
+        # Load header values
+        for i in range(0, len(init_vars), 2):
+            self.add_bundle({"load": [("const", tmp[0], i), ("const", tmp[1], i + 1 if i + 1 < len(init_vars) else 0)]})
+            loads = [("load", self.scratch[init_vars[i]], tmp[0])]
+            if i + 1 < len(init_vars):
+                loads.append(("load", self.scratch[init_vars[i+1]], tmp[1]))
+            self.add_bundle({"load": loads})
+
+        # Broadcast vector constants
+        self.add_bundle({"valu": [
+            ("vbroadcast", v_zero, zero_c),
+            ("vbroadcast", v_one, one_c),
+            ("vbroadcast", v_two, two_c),
+            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+        ]})
+
+        # Broadcast hash constants (6 valu slots, can do 6 broadcasts per cycle)
+        for hi in range(0, len(HASH_STAGES), 3):
+            vops = []
+            for j in range(min(3, len(HASH_STAGES) - hi)):
+                v_c1, v_c3 = v_hash[hi + j]
+                c1, c3, _, _ = hash_c[hi + j]
+                vops.append(("vbroadcast", v_c1, c1))
+                vops.append(("vbroadcast", v_c3, c3))
+            self.add_bundle({"valu": vops})
+
+        self.add("flow", ("pause",))
+
+        # =========================================================
+        # PHASE 3: MAIN LOOP
+        # =========================================================
+
+        self.add_bundle({"load": [("const", round_i, 0)]})
+        round_loop = len(self.instrs)
+
+        self.add_bundle({"load": [("const", chunk_i, 0)]})
+        chunk_loop = len(self.instrs)
+
+        # Compute addresses: addr = base + chunk_i * VLEN
+        self.add_bundle({"alu": [("*", tmp[0], chunk_i, vlen_c)]})
+        self.add_bundle({"alu": [
+            ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
+            ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
+        ]})
+
+        # Load v_idx and v_val
+        self.add_bundle({"load": [("vload", v_idx, tmp[0]), ("vload", v_val, tmp[1])]})
+
+        # Gather tree nodes (2 scalar loads per cycle)
+        for vi in range(0, VLEN, 2):
+            self.add_bundle({"alu": [
+                ("+", tmp[2], self.scratch["forest_values_p"], v_idx + vi),
+                ("+", tmp[3], self.scratch["forest_values_p"], v_idx + vi + 1),
+            ]})
+            self.add_bundle({"load": [
+                ("load", v_node_val + vi, tmp[2]),
+                ("load", v_node_val + vi + 1, tmp[3]),
+            ]})
+
+        # Hash computation
+        self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v_c1, v_c3 = v_hash[hi]
+            self.add_bundle({"valu": [
+                (op1, v_tmp1, v_val, v_c1),
+                (op3, v_tmp2, v_val, v_c3),
+            ]})
+            self.add_bundle({"valu": [(op2, v_val, v_tmp1, v_tmp2)]})
+
+        # Tree step
+        self.add_bundle({"valu": [("*", v_idx, v_idx, v_two), ("&", v_tmp1, v_val, v_one)]})
+        self.add_bundle({"valu": [("+", v_idx, v_idx, v_one)]})
+        self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})
+        self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
+        self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
+
+        # Store results
+        self.add_bundle({"alu": [("*", tmp[0], chunk_i, vlen_c)]})
+        self.add_bundle({"alu": [
+            ("+", tmp[0], self.scratch["inp_indices_p"], tmp[0]),
+            ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
+        ]})
+        self.add_bundle({"store": [("vstore", tmp[0], v_idx), ("vstore", tmp[1], v_val)]})
+
+        # Loop control - increment FIRST, then compare in next cycle
+        self.add_bundle({"flow": [("add_imm", chunk_i, chunk_i, 1)]})
+        self.add_bundle({"alu": [("<", cond, chunk_i, n_chunks_c)]})
+        self.add_bundle({"flow": [("cond_jump", cond, chunk_loop)]})
+
+        self.add_bundle({"flow": [("add_imm", round_i, round_i, 1)]})
+        self.add_bundle({"alu": [("<", cond, round_i, rounds_c)]})
+        self.add_bundle({"flow": [("cond_jump", cond, round_loop)]})
+
+        self.add("flow", ("pause",))
+
 
 BASELINE = 147734
 
 def do_kernel_test(
-    forest_height: int,
-    rounds: int,
-    batch_size: int,
-    seed: int = 123,
-    trace: bool = False,
-    prints: bool = False,
+    forest_height: int, rounds: int, batch_size: int,
+    seed: int = 123, trace: bool = False, prints: bool = False,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -168,85 +235,27 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
-    value_trace = {}
-    machine = Machine(
-        mem,
-        kb.instrs,
-        kb.debug_info(),
-        n_cores=N_CORES,
-        value_trace=value_trace,
-        trace=trace,
-    )
-    machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+    machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES, trace=trace, prints=prints)
+
+    for expected in reference_kernel2(mem, forest.height, len(inp.values), rounds):
         machine.run()
-        inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
-
-    print("CYCLES: ", machine.cycle)
-    print("Speedup over baseline: ", BASELINE / machine.cycle)
+        inp_values_p = mem[6]
+        assert machine.mem[inp_values_p:inp_values_p + len(inp.values)] == expected[inp_values_p:inp_values_p + len(inp.values)], f"Incorrect values"
+        inp_indices_p = mem[5]
+        assert machine.mem[inp_indices_p:inp_indices_p + len(inp.indices)] == expected[inp_indices_p:inp_indices_p + len(inp.indices)], f"Incorrect indices"
     return machine.cycle
 
 
-class Tests(unittest.TestCase):
-    def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
-        random.seed(123)
-        for i in range(10):
-            f = Tree.generate(4)
-            inp = Input.generate(f, 10, 6)
-            mem = build_mem_image(f, inp)
-            reference_kernel(f, inp)
-            for _ in reference_kernel2(mem, {}):
-                pass
-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
-
-    def test_kernel_trace(self):
-        # Full-scale example for performance testing
-        do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
+class KernelTest(unittest.TestCase):
+    def test_kernel_correctness(self):
+        for seed in range(8):
+            do_kernel_test(10, 16, 256, seed)
 
     def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256)
+        cycles = do_kernel_test(10, 16, 256)
+        print("CYCLES: ", cycles)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
