@@ -101,30 +101,10 @@ class KernelBuilder:
         INP_VALUES_P = INP_INDICES_P + batch_size   # 2310
 
         # =========================================================
-        # PHASE 1: ALLOCATE ALL SCRATCH MEMORY (no instructions yet)
+        # PHASE 1: ALLOCATE SCRATCH MEMORY ONLY (no constants needed!)
         # =========================================================
 
-        # Scalar constants - allocate addresses only
-        scalar_consts = {}  # value -> address
-        def alloc_scalar(val, name=None):
-            if val not in scalar_consts:
-                scalar_consts[val] = self.alloc_scratch(name)
-            return scalar_consts[val]
-
-        # Pre-computed base addresses as constants (no header loading needed!)
-        idx_base_consts = [alloc_scalar(INP_INDICES_P + u * VLEN, f"idx_base_{u}") for u in range(UNROLL)]
-        val_base_consts = [alloc_scalar(INP_VALUES_P + u * VLEN, f"val_base_{u}") for u in range(UNROLL)]
-        n_nodes_const = alloc_scalar(N_NODES, "n_nodes")
-
-        # Cache stride offsets (n_cache_slots = 256 for 256-way parallel loading)
-        n_cache_slots = 256
-        cache_stride = (N_NODES + n_cache_slots - 1) // n_cache_slots
-        cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN
-        # Pre-computed cache pointers as constants
-        cache_ptr_consts = [alloc_scalar(FOREST_VALUES_P + i * cache_stride, f"cache_ptr_{i}") for i in range(n_cache_slots)]
-
         # Vector registers - allocate scratch space
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_idx = [self.alloc_scratch(f"v_idx_{u}", VLEN) for u in range(UNROLL)]
         v_val = [self.alloc_scratch(f"v_val_{u}", VLEN) for u in range(UNROLL)]
 
@@ -132,45 +112,40 @@ class KernelBuilder:
         CACHE_SIZE = N_NODES
         tree_cache = self.alloc_scratch("tree_cache", CACHE_SIZE)
 
-        # =========================================================
-        # PHASE 2: LOAD ALL CONSTANTS (single cycle!)
-        # =========================================================
-        const_list = list(scalar_consts.items())  # [(value, addr), ...]
-
-        # All scalar constants in one cycle (should fit in 320 load slots)
-        self.add_bundle({
-            "load": [("const", addr, val) for val, addr in const_list],
-        })
+        # Cache parameters
+        n_cache_slots = 256
+        cache_stride = (N_NODES + n_cache_slots - 1) // n_cache_slots
+        cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN
 
         # =========================================================
-        # PHASE 3: BROADCAST + LOAD DATA + CACHE (merged where possible)
+        # PHASE 2: LOAD DATA + CACHE (single cycle with vload_imm!)
         # =========================================================
-
-        # Broadcast n_nodes + load idx/val/cache (valu:1 + load:320)
+        # Using vload_imm with immediate addresses - NO CONSTANTS NEEDED!
         cache_load_ops = []
         for i in range(n_cache_slots):
             dest_offset = i * cache_stride
             if dest_offset < N_NODES:
-                cache_load_ops.append(("vload", tree_cache + dest_offset, cache_ptr_consts[i]))
+                cache_load_ops.append(("vload_imm", tree_cache + dest_offset, FOREST_VALUES_P + i * cache_stride))
+
         self.add_bundle({
-            "valu": [("vbroadcast", v_n_nodes, n_nodes_const)],
-            "load": [("vload", v_idx[i], idx_base_consts[i]) for i in range(UNROLL)] +
-                    [("vload", v_val[i], val_base_consts[i]) for i in range(UNROLL)] +
+            "load": [("vload_imm", v_idx[i], INP_INDICES_P + i * VLEN) for i in range(UNROLL)] +
+                    [("vload_imm", v_val[i], INP_VALUES_P + i * VLEN) for i in range(UNROLL)] +
                     cache_load_ops,
         })
 
         # === FULLY UNROLLED ROUNDS ===
         # With 16 fixed rounds, unroll completely to avoid loop overhead
         # Each round is 1 cycle with gather_hash_step
+        # N_NODES passed as immediate constant (int) instead of scratch address
         for round_num in range(rounds):
             self.add_bundle({
-                "valu": [("gather_hash_step", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, v_n_nodes) for i in range(UNROLL)],
+                "valu": [("gather_hash_step", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, N_NODES) for i in range(UNROLL)],
             })
 
         # === STORE VAL ONCE AT END ===
         # Only store final values to memory after all rounds complete
         self.add_bundle({
-            "store": [("vstore", val_base_consts[i], v_val[i]) for i in range(UNROLL)],
+            "store": [("vstore_imm", INP_VALUES_P + i * VLEN, v_val[i]) for i in range(UNROLL)],
         })
 
 BASELINE = 147734

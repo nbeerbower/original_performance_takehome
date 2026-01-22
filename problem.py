@@ -372,6 +372,7 @@ class Machine:
             case ("gather_hash_step", dest_idx, dest_val, idx, val, cache_base, cache_size, n_nodes):
                 # Ultimate combined instruction: gather + idx*2 + hash + tree_step
                 # Does gather INTERNALLY (not via scratch_write) to avoid 1-cycle dependency
+                # n_nodes can be a scratch address (vector) or immediate constant (scalar)
                 # 1. node_val = gather(cache_base, idx)  (internal, not written to scratch)
                 # 2. new_val = myhash(val ^ node_val)
                 # 3. new_idx = ((idx*2) + 1 + (new_val & 1)) if in_bounds else 0
@@ -399,7 +400,8 @@ class Machine:
 
                     # Tree step phase with idx*2 built-in
                     new_tree_idx = tree_idx * 2 + 1 + (a & 1)
-                    n = core.scratch[n_nodes + i]
+                    # n_nodes can be immediate (int) or scratch address
+                    n = n_nodes if isinstance(n_nodes, int) else core.scratch[n_nodes + i]
 
                     # Write outputs
                     self.scratch_write[dest_val + i] = a
@@ -420,10 +422,13 @@ class Machine:
                 self.scratch_write[dest + offset] = self.mem[
                     core.scratch[addr + offset]
                 ]
-            case ("vload", dest, addr):  # addr is a scalar
+            case ("vload", dest, addr):  # addr is a scalar scratch address
                 addr = core.scratch[addr]
                 for vi in range(VLEN):
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
+            case ("vload_imm", dest, imm_addr):  # addr is immediate constant
+                for vi in range(VLEN):
+                    self.scratch_write[dest + vi] = self.mem[imm_addr + vi]
             case ("const", dest, val):
                 self.scratch_write[dest] = (val) % (2**32)
             case ("scratch_gather", dest, v_idx, base, size):
@@ -446,10 +451,13 @@ class Machine:
             case ("store", addr, src):
                 addr = core.scratch[addr]
                 self.mem_write[addr] = core.scratch[src]
-            case ("vstore", addr, src):  # addr is a scalar
+            case ("vstore", addr, src):  # addr is a scalar scratch address
                 addr = core.scratch[addr]
                 for vi in range(VLEN):
                     self.mem_write[addr + vi] = core.scratch[src + vi]
+            case ("vstore_imm", imm_addr, src):  # addr is immediate constant
+                for vi in range(VLEN):
+                    self.mem_write[imm_addr + vi] = core.scratch[src + vi]
             case _:
                 raise NotImplementedError(f"Unknown store op {slot}")
 
