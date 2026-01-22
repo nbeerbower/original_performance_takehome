@@ -171,46 +171,34 @@ class KernelBuilder:
                     [("const", addr, val) for val, addr in remaining_consts]
         })
 
-        self.add("flow", ("pause",))
-
         # =========================================================
-        # PHASE 3: VECTOR BROADCASTS + CACHE LOADING (64-way parallel)
+        # PHASE 3: MERGED SETUP (320 ALU + 2 VALU + 1 load + 1 flow)
         # =========================================================
 
-        # Compute base addresses + init round counter (alu:64 + load:1)
-        # round_counter starts at 1 because we compare BEFORE incrementing
+        # Pause + base addresses + cache_ptr init + broadcasts + round_counter
+        # All inputs (header values, scalar consts) available from cycles 0-1
         self.add_bundle({
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)] +
-                   [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
-            "load": [("const", round_counter, 1)],
-        })
-
-        # Broadcast + cache ptr init + initial idx load (valu:2 + alu:64 + load:32)
-        # idx_base was computed in previous cycle, can read now
-        self.add_bundle({
+                   [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)] +
+                   [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i]) for i in range(n_cache_slots)],
             "valu": [
                 ("vbroadcast", v_two, two_const),
                 ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
             ],
-            "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i])
-                   for i in range(n_cache_slots)],
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
+            "load": [("const", round_counter, 1)],
+            "flow": [("pause",)],
         })
 
-        # 64-way parallel cache loading: 64 loads + 64 ptr updates per cycle
-        for chunk in range(0, cache_stride, VLEN):
-            load_ops = []
-            alu_ops = []
-            for i in range(n_cache_slots):
-                dest_offset = i * cache_stride + chunk
-                if dest_offset < n_nodes:
-                    load_ops.append(("vload", tree_cache + dest_offset, cache_ptr[i]))
-                    alu_ops.append(("+", cache_ptr[i], cache_ptr[i], eight_const))
-            if load_ops:
-                bundle = {"load": load_ops}
-                if alu_ops:
-                    bundle["alu"] = alu_ops
-                self.add_bundle(bundle)
+        # idx load + cache load (288 loads total)
+        # idx_base and cache_ptr computed in previous cycle, available now
+        cache_load_ops = []
+        for i in range(n_cache_slots):
+            dest_offset = i * cache_stride
+            if dest_offset < n_nodes:
+                cache_load_ops.append(("vload", tree_cache + dest_offset, cache_ptr[i]))
+        self.add_bundle({
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)] + cache_load_ops,
+        })
 
         round_loop_start = len(self.instrs)
 
@@ -237,8 +225,6 @@ class KernelBuilder:
             "flow": [("add_imm", round_counter, round_counter, 1),
                      ("cond_jump", loop_cond, round_loop_start)],
         })
-
-        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
