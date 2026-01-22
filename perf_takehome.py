@@ -152,23 +152,24 @@ class KernelBuilder:
         # PHASE 2: BATCHED CONSTANT LOADING (minimal cycles)
         # =========================================================
 
-        # Load header: batch all const addresses, then batch all loads (2 cycles total)
-        # Cycle 1: const 0,1,2,3,4,5,6 into temp addresses
-        self.add_bundle({
-            "load": [("const", addr_temps[i], i) for i in range(len(init_vars))]
-        })
-        # Cycle 2: load all init_vars from their addresses
-        self.add_bundle({
-            "load": [("load", self.scratch[init_vars[i]], addr_temps[i]) for i in range(len(init_vars))]
-        })
-
-        # Load ALL scalar constants in batches of 64 (max load slots)
+        # Merge header loading with scalar constants to minimize cycles
+        # Cycle 0: header const (7) + scalar const (up to 57) = 64 max
+        # Cycle 1: header load (7) + remaining scalar const
         const_list = list(scalar_consts.items())  # [(value, addr), ...]
-        for batch_start in range(0, len(const_list), 64):
-            batch = const_list[batch_start:batch_start + 64]
-            self.add_bundle({
-                "load": [("const", addr, val) for val, addr in batch]
-            })
+        n_header = len(init_vars)  # 7
+        slots_in_cycle0 = 64 - n_header  # 57 scalar consts fit in cycle 0
+
+        # Cycle 0: header const addresses + first batch of scalar constants
+        self.add_bundle({
+            "load": [("const", addr_temps[i], i) for i in range(n_header)] +
+                    [("const", addr, val) for val, addr in const_list[:slots_in_cycle0]]
+        })
+        # Cycle 1: header load + remaining scalar constants
+        remaining_consts = const_list[slots_in_cycle0:]
+        self.add_bundle({
+            "load": [("load", self.scratch[init_vars[i]], addr_temps[i]) for i in range(n_header)] +
+                    [("const", addr, val) for val, addr in remaining_consts]
+        })
 
         self.add("flow", ("pause",))
 
