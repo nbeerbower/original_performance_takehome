@@ -174,25 +174,34 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
-        # Load ALL tree nodes into cache using vload
-        cache_load_ptr = self.alloc_scratch("cache_load_ptr")
-        self.add("alu", ("+", cache_load_ptr, self.scratch["forest_values_p"], zero_const))  # cache_load_ptr = forest_values_p
+        # Load ALL tree nodes into cache using vload with 8 parallel pointers
+        # 2047 nodes / 8 = 256 vloads, but with 8 load slots = 32 cycles
+        n_cache_slots = 8
+        cache_ptr = [self.alloc_scratch(f"cache_ptr_{i}") for i in range(n_cache_slots)]
+        cache_stride = (n_nodes + n_cache_slots - 1) // n_cache_slots  # Nodes per slot
+        cache_stride = (cache_stride + VLEN - 1) // VLEN * VLEN  # Round up to VLEN
+        cache_stride_const = self.scratch_const(cache_stride, "cache_stride")
         eight_const = self.scratch_const(8, "eight")
-        for i in range(0, n_nodes, VLEN):
-            remaining = min(VLEN, n_nodes - i)
-            if remaining == VLEN:
-                # Full vector load
-                self.add_bundle({
-                    "load": [("vload", tree_cache + i, cache_load_ptr)],
-                    "alu": [("+", cache_load_ptr, cache_load_ptr, eight_const)]
-                })
-            else:
-                # Partial load for last chunk (load individually)
-                for j in range(remaining):
-                    self.add_bundle({
-                        "load": [("load", tree_cache + i + j, cache_load_ptr)],
-                        "alu": [("+", cache_load_ptr, cache_load_ptr, one_const)]
-                    })
+
+        # Initialize pointers: ptr[i] = forest_p + i * cache_stride
+        for i in range(n_cache_slots):
+            offset = self.scratch_const(i * cache_stride, f"cache_offset_{i}")
+            self.add("alu", ("+", cache_ptr[i], self.scratch["forest_values_p"], offset))
+
+        # Load in parallel: each cycle loads 8 vectors (one from each pointer)
+        for chunk in range(0, cache_stride, VLEN):
+            load_ops = []
+            alu_ops = []
+            for i in range(n_cache_slots):
+                dest_offset = i * cache_stride + chunk
+                if dest_offset < n_nodes:
+                    load_ops.append(("vload", tree_cache + dest_offset, cache_ptr[i]))
+                    alu_ops.append(("+", cache_ptr[i], cache_ptr[i], eight_const))
+            if load_ops:
+                bundle = {"load": load_ops}
+                if alu_ops:
+                    bundle["alu"] = alu_ops
+                self.add_bundle(bundle)
 
         # Initialize round counter
         self.add("load", ("const", round_counter, 0))
