@@ -239,7 +239,6 @@ class KernelBuilder:
         # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===
         # With flow=2, can combine increment + cond_jump in same cycle
         # Key insight: compare BEFORE increment, then increment + cond_jump together
-        # This requires starting round_counter at 1 (not 0)
 
         # Cycle 1: store ALL idx[0-31] + compare (32 stores + 1 ALU)
         # Compare reads round_counter before it's incremented
@@ -248,7 +247,8 @@ class KernelBuilder:
             "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
         })
         # Cycle 2: store ALL val[0-31] + load ALL idx[0-31] + increment + cond_jump
-        # cond_jump reads loop_cond from cycle 1, increment + jump both use flow slots
+        # Note: store val and load idx don't conflict (different memory locations)
+        # cond_jump reads loop_cond from previous cycle, increment + jump both use flow slots
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(UNROLL)],
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],

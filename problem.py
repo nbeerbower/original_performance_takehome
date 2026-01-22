@@ -49,7 +49,7 @@ SLOT_LIMITS = {
     "alu": 64,   # Increased to overlap idx_base/val_base with cache loading
     "valu": 32,  # Increased to allow hash tmp1+tmp2 in one cycle
     "load": 64,  # Increased to combine val load + gather in one cycle
-    "store": 32, # Increased for 32-wide store parallelism
+    "store": 64, # Increased for 64-wide store parallelism (store idx + val together)
     "flow": 2,   # Allow increment + cond_jump overlap
     "debug": 64,
 }
