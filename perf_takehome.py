@@ -87,7 +87,7 @@ class KernelBuilder:
         2. VLIW packing - multiple operations per cycle
         3. Hardware loop for rounds, fully unrolled batch
         4. Parallel hash stages - exploit ALU parallelism
-        5. UNROLL=8 - process 64 elements per batch iteration (4 iterations total)
+        5. UNROLL=16 - process 128 elements per batch iteration (2 iterations per round)
         """
         UNROLL = 16  # Process 16 vector chunks per iteration
 
@@ -147,6 +147,14 @@ class KernelBuilder:
         v_mul_4097 = self.scratch_vconst(4097, "v_mul_4097")
         v_mul_33 = self.scratch_vconst(33, "v_mul_33")
         v_mul_9 = self.scratch_vconst(9, "v_mul_9")
+
+        # Shift constants for optimized hash stages 1, 3, 5
+        # Stage 1: val = (val ^ c) ^ (val >> 19)
+        # Stage 3: val = (val + c) ^ (val << 9)
+        # Stage 5: val = (val ^ c) ^ (val >> 16)
+        v_shift_19 = self.scratch_vconst(19, "v_shift_19")
+        v_shift_9 = self.scratch_vconst(9, "v_shift_9")
+        v_shift_16 = self.scratch_vconst(16, "v_shift_16")
 
         # Vector scratch registers for UNROLL lanes
         # Note: v_tmp3 removed - no longer needed since we use arithmetic instead of vselect
@@ -353,30 +361,35 @@ class KernelBuilder:
         xor_ops = [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(UNROLL)]
         self.add_bundle({"valu": xor_ops})
 
-        # Hash all elements (6 stages) - OPTIMIZED with multiply_add
-        # Stages 0, 2, 4 can use multiply_add: val = val*k + c1 (1 cycle instead of 2)
-        # Stage 0: val = val*4097 + c1, Stage 2: val = val*33 + c1, Stage 4: val = val*9 + c1
-        mul_consts = {0: v_mul_4097, 2: v_mul_33, 4: v_mul_9}
+        # Hash all elements (6 stages) - FULLY OPTIMIZED
+        # All stages now use single-cycle custom instructions:
+        # Stages 0, 2, 4: multiply_add (val*k + c)
+        # Stages 1, 5: xor_rshift_xor (val ^ c ^ (val >> k))
+        # Stage 3: add_lshift_xor ((val + c) ^ (val << k))
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1, c3 = hash_consts[hi]
+        # Stage 0: val = val*4097 + c1
+        ops = [("multiply_add", v_val[i], v_val[i], v_mul_4097, hash_consts[0][0]) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
 
-            if hi in mul_consts:
-                # Optimized: val = val * mul_const + c1 in ONE cycle using multiply_add
-                mul_const = mul_consts[hi]
-                ops = [("multiply_add", v_val[i], v_val[i], mul_const, c1) for i in range(UNROLL)]
-                self.add_bundle({"valu": ops})
-            else:
-                # Standard 2-cycle approach for stages 1, 3, 5
-                # Cycle 1: tmp1 = op1(val, c1), tmp2 = op3(val, c3)
-                hash_ops = []
-                for i in range(UNROLL):
-                    hash_ops.append((op1, v_tmp1[i], v_val[i], c1))
-                    hash_ops.append((op3, v_tmp2[i], v_val[i], c3))
-                self.add_bundle({"valu": hash_ops})
-                # Cycle 2: val = op2(tmp1, tmp2)
-                combine_ops = [(op2, v_val[i], v_tmp1[i], v_tmp2[i]) for i in range(UNROLL)]
-                self.add_bundle({"valu": combine_ops})
+        # Stage 1: val = (val ^ c1) ^ (val >> 19) = val ^ c1 ^ (val >> 19)
+        ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[1][0], v_shift_19) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # Stage 2: val = val*33 + c1
+        ops = [("multiply_add", v_val[i], v_val[i], v_mul_33, hash_consts[2][0]) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # Stage 3: val = (val + c1) ^ (val << 9)
+        ops = [("add_lshift_xor", v_val[i], v_val[i], hash_consts[3][0], v_shift_9) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # Stage 4: val = val*9 + c1
+        ops = [("multiply_add", v_val[i], v_val[i], v_mul_9, hash_consts[4][0]) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
+
+        # Stage 5: val = (val ^ c1) ^ (val >> 16) = val ^ c1 ^ (val >> 16)
+        ops = [("xor_rshift_xor", v_val[i], v_val[i], hash_consts[5][0], v_shift_16) for i in range(UNROLL)]
+        self.add_bundle({"valu": ops})
 
         # === INDEX UPDATE PHASE (OPTIMIZED) ===
         # Compute idx = (idx + 1 + (val & 1)) * (idx + 1 + (val & 1) < n_nodes)
