@@ -406,6 +406,40 @@ class Machine:
                     # Write outputs
                     self.scratch_write[dest_val + i] = a
                     self.scratch_write[dest_idx + i] = new_tree_idx if new_tree_idx < n else 0
+            case ("gather_hash_step_store", dest_idx, dest_val, idx, val, cache_base, cache_size, n_nodes, mem_addr):
+                # Final round variant: same as gather_hash_step but ALSO stores val to memory
+                # Combines round + store into single cycle
+                for i in range(VLEN):
+                    # Gather phase (INTERNAL - read directly, don't use scratch_write)
+                    tree_idx = core.scratch[idx + i]
+                    clamped_idx = min(tree_idx, cache_size - 1)
+                    node_val = core.scratch[cache_base + clamped_idx]  # Direct read
+
+                    # Hash phase (using gathered value immediately)
+                    a = core.scratch[val + i] ^ node_val
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        if op1 == "+":
+                            t1 = (a + val1) % (2**32)
+                        else:
+                            t1 = a ^ val1
+                        if op3 == "<<":
+                            t2 = (a << val3) % (2**32)
+                        else:
+                            t2 = a >> val3
+                        if op2 == "+":
+                            a = (t1 + t2) % (2**32)
+                        else:
+                            a = t1 ^ t2
+
+                    # Tree step phase with idx*2 built-in
+                    new_tree_idx = tree_idx * 2 + 1 + (a & 1)
+                    n = n_nodes if isinstance(n_nodes, int) else core.scratch[n_nodes + i]
+
+                    # Write to scratch (for consistency, though idx won't be used after)
+                    self.scratch_write[dest_val + i] = a
+                    self.scratch_write[dest_idx + i] = new_tree_idx if new_tree_idx < n else 0
+                    # ALSO write val directly to memory - combining store with final round
+                    self.mem_write[mem_addr + i] = a
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)

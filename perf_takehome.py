@@ -135,17 +135,16 @@ class KernelBuilder:
 
         # === FULLY UNROLLED ROUNDS ===
         # With 16 fixed rounds, unroll completely to avoid loop overhead
-        # Each round is 1 cycle with gather_hash_step
-        # N_NODES passed as immediate constant (int) instead of scratch address
-        for round_num in range(rounds):
+        # Rounds 1-15: gather_hash_step
+        # Round 16: gather_hash_step_store (combines final round + store)
+        for round_num in range(rounds - 1):
             self.add_bundle({
                 "valu": [("gather_hash_step", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, N_NODES) for i in range(UNROLL)],
             })
 
-        # === STORE VAL ONCE AT END ===
-        # Only store final values to memory after all rounds complete
+        # Final round + store combined
         self.add_bundle({
-            "store": [("vstore_imm", INP_VALUES_P + i * VLEN, v_val[i]) for i in range(UNROLL)],
+            "valu": [("gather_hash_step_store", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, N_NODES, INP_VALUES_P + i * VLEN) for i in range(UNROLL)],
         })
 
 BASELINE = 147734
