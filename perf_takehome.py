@@ -240,15 +240,16 @@ class KernelBuilder:
             "load": [("const", round_counter, 0)],
         })
 
-        round_loop_start = len(self.instrs)
-
-        # === ROUND START: Load idx (2 cycles) ===
+        # === ROUND 0 ONLY: Load idx before loop (2 cycles) ===
+        # Subsequent rounds load idx in store phase of previous round
         self.add_bundle({
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
         })
         self.add_bundle({
             "load": [("vload", v_idx[i], idx_base[i]) for i in range(16, UNROLL)],
         })
+
+        round_loop_start = len(self.instrs)
 
         # === LOAD PHASE: Load all 32 val vectors (2 cycles with 16 load slots) ===
         self.add_bundle({
@@ -304,26 +305,29 @@ class KernelBuilder:
         ops = [("tree_step", v_idx[i], v_idx[i], v_val[i], v_n_nodes) for i in range(UNROLL)]
         self.add_bundle({"valu": ops})
 
-        # === STORE PHASE + ROUND LOOP CONTROL (overlapped) ===
-        # Overlap round loop control with store phase to save cycles
+        # === STORE PHASE + ROUND LOOP CONTROL + LOAD IDX FOR NEXT ROUND (overlapped) ===
+        # Overlap round loop control and next round's idx load with store phase
 
         # Cycle 1: store idx[0-15] + increment round_counter (flow)
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16)],
             "flow": [("add_imm", round_counter, round_counter, 1)],
         })
-        # Cycle 2: store idx[16-31] + compare (ALU)
-        # Compare reads the NEW round_counter (incremented in cycle 1)
+        # Cycle 2: store idx[16-31] + compare + load idx[0-15] for next round
+        # idx[0-15] was stored in cycle 1, now available for reading
         self.add_bundle({
             "store": [("vstore", idx_base[i], v_idx[i]) for i in range(16, UNROLL)],
             "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16)],
         })
-        # Cycle 3: store val[0-15]
+        # Cycle 3: store val[0-15] + load idx[16-31] for next round
+        # idx[16-31] was stored in cycle 2, now available for reading
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(16)],
+            "load": [("vload", v_idx[i], idx_base[i]) for i in range(16, UNROLL)],
         })
         # Cycle 4: store val[16-31] + cond_jump (flow)
-        # cond_jump after all stores complete
+        # cond_jump goes to round_loop_start which is AFTER initial idx load
         self.add_bundle({
             "store": [("vstore", val_base[i], v_val[i]) for i in range(16, UNROLL)],
             "flow": [("cond_jump", loop_cond, round_loop_start)],
