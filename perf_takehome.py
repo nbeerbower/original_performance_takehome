@@ -176,16 +176,12 @@ class KernelBuilder:
         # PHASE 3: VECTOR BROADCASTS + CACHE LOADING
         # =========================================================
 
-        # Broadcast scalar constants to vector registers (2 ops, can batch)
+        # Broadcast scalar constants + initialize cache pointers (valu + alu in same cycle)
         self.add_bundle({
             "valu": [
                 ("vbroadcast", v_two, two_const),
                 ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
-            ]
-        })
-
-        # Initialize cache pointers: ptr[i] = forest_p + i * cache_stride (32 ALU ops, 1 cycle)
-        self.add_bundle({
+            ],
             "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i])
                    for i in range(n_cache_slots)],
         })
@@ -213,17 +209,12 @@ class KernelBuilder:
         self.add_bundle({
             "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
         })
-        # Compute ALL val_base[0-31] + init round counter
+        # Compute ALL val_base[0-31] + init round counter + load initial idx
         # round_counter starts at 1 because we compare BEFORE incrementing
+        # vload reads idx_base computed in previous cycle (write-at-end semantics)
         self.add_bundle({
             "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
-            "load": [("const", round_counter, 1)],
-        })
-
-        # === ROUND 0 ONLY: Load idx before loop (1 cycle with 32 load slots) ===
-        # Subsequent rounds load idx in store phase of previous round
-        self.add_bundle({
-            "load": [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
+            "load": [("const", round_counter, 1)] + [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
 
         round_loop_start = len(self.instrs)
