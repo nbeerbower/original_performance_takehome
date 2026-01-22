@@ -173,20 +173,22 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         # =========================================================
-        # PHASE 3: VECTOR BROADCASTS + CACHE LOADING
+        # PHASE 3: VECTOR BROADCASTS + CACHE LOADING (overlapped with base addr computation)
         # =========================================================
 
-        # Broadcast scalar constants + initialize cache pointers (valu + alu in same cycle)
+        # Broadcast + cache ptr init + idx_base (all in one cycle with 64 ALU slots)
         self.add_bundle({
             "valu": [
                 ("vbroadcast", v_two, two_const),
                 ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
             ],
             "alu": [("+", cache_ptr[i], self.scratch["forest_values_p"], cache_offset_consts[i])
-                   for i in range(n_cache_slots)],
+                   for i in range(n_cache_slots)] +
+                   [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
         })
 
-        # Load tree nodes in parallel: each cycle loads 32 vectors
+        # First cache load cycle also computes val_base (64 ALU: 32 ptr update + 32 val_base)
+        first_chunk = True
         for chunk in range(0, cache_stride, VLEN):
             load_ops = []
             alu_ops = []
@@ -197,23 +199,21 @@ class KernelBuilder:
                     alu_ops.append(("+", cache_ptr[i], cache_ptr[i], eight_const))
             if load_ops:
                 bundle = {"load": load_ops}
+                if first_chunk:
+                    # Add val_base computation to first cache load cycle
+                    alu_ops += [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)]
+                    first_chunk = False
                 if alu_ops:
                     bundle["alu"] = alu_ops
                 self.add_bundle(bundle)
 
         # =========================================================
-        # PHASE 4: PRECOMPUTE BASE ADDRESSES + ROUND LOOP
+        # PHASE 4: ROUND LOOP SETUP
         # =========================================================
 
-        # Compute ALL idx_base[0-31] (32 ALU ops)
-        self.add_bundle({
-            "alu": [("+", idx_base[i], self.scratch["inp_indices_p"], offset_consts[i]) for i in range(UNROLL)],
-        })
-        # Compute ALL val_base[0-31] + init round counter + load initial idx
+        # Load initial idx + init round counter (idx_base computed earlier, can read now)
         # round_counter starts at 1 because we compare BEFORE incrementing
-        # vload reads idx_base computed in previous cycle (write-at-end semantics)
         self.add_bundle({
-            "alu": [("+", val_base[i], self.scratch["inp_values_p"], offset_consts[i]) for i in range(UNROLL)],
             "load": [("const", round_counter, 1)] + [("vload", v_idx[i], idx_base[i]) for i in range(UNROLL)],
         })
 
