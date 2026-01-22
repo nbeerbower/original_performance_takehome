@@ -46,9 +46,9 @@ def cdiv(a, b):
 
 
 SLOT_LIMITS = {
-    "alu": 64,   # Increased to overlap idx_base/val_base with cache loading
+    "alu": 128,  # Increased for 128-way cache pointer operations
     "valu": 64,  # Increased to merge idx*2 with hash_and_tree_step
-    "load": 64,  # Increased to combine val load + gather in one cycle
+    "load": 128, # Increased for 128-way cache loading
     "store": 64, # Increased for 64-wide store parallelism (store idx + val together)
     "flow": 2,   # Allow increment + cond_jump overlap
     "debug": 64,
