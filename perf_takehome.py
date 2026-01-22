@@ -177,69 +177,79 @@ class KernelBuilder:
 
         # FULLY UNROLLED: 16 rounds with idx/val staying in scratch
         for round_num in range(rounds):
-            # Gather tree nodes - PIPELINED with XOR overlapped (5 cycles for gather+XOR)
-            # Use scalar alu XOR to overlap with gather (12 alu slots available)
+            # OPTIMIZATION: Round 0 has all idx=0 (all start at root)
+            # Just load tree.values[0] once and broadcast - saves ~4 cycles per chunk
+            if round_num == 0:
+                # Load root node value directly (all idx are 0)
+                self.add_bundle({"load": [("load", tmp[4], self.scratch["forest_values_p"])]})
+                # Broadcast to all 8 positions
+                self.add_bundle({"valu": [("vbroadcast", v_node_val, tmp[4])]})
+                # Vector XOR
+                self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
+            else:
+                # Gather tree nodes - PIPELINED with XOR overlapped (6 cycles for gather+XOR)
+                # Use scalar alu XOR to overlap with gather (12 alu slots available)
 
-            # Cycle 1: compute addresses for elements 0,1
-            self.add_bundle({"alu": [
-                ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 0),
-                ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 1),
-            ]})
-            # Cycle 2: load[0,1] + addr[2,3]
-            self.add_bundle({
-                "load": [
-                    ("load", v_node_val + 0, tmp[2]),
-                    ("load", v_node_val + 1, tmp[3]),
-                ],
-                "alu": [
-                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 2),
-                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 3),
-                ]
-            })
-            # Cycle 3: load[2,3] + addr[4,5] + XOR[0,1]
-            self.add_bundle({
-                "load": [
-                    ("load", v_node_val + 2, tmp[2]),
-                    ("load", v_node_val + 3, tmp[3]),
-                ],
-                "alu": [
-                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 4),
-                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 5),
-                    ("^", v_val + 0, v_val + 0, v_node_val + 0),
-                    ("^", v_val + 1, v_val + 1, v_node_val + 1),
-                ]
-            })
-            # Cycle 4: load[4,5] + addr[6,7] + XOR[2,3]
-            self.add_bundle({
-                "load": [
-                    ("load", v_node_val + 4, tmp[2]),
-                    ("load", v_node_val + 5, tmp[3]),
-                ],
-                "alu": [
-                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 6),
-                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 7),
-                    ("^", v_val + 2, v_val + 2, v_node_val + 2),
-                    ("^", v_val + 3, v_val + 3, v_node_val + 3),
-                ]
-            })
-            # Cycle 5: load[6,7] + XOR[4,5]
-            self.add_bundle({
-                "load": [
-                    ("load", v_node_val + 6, tmp[2]),
-                    ("load", v_node_val + 7, tmp[3]),
-                ],
-                "alu": [
-                    ("^", v_val + 4, v_val + 4, v_node_val + 4),
-                    ("^", v_val + 5, v_val + 5, v_node_val + 5),
-                ]
-            })
-            # Cycle 6: XOR[6,7] - must wait for load to complete
-            self.add_bundle({
-                "alu": [
-                    ("^", v_val + 6, v_val + 6, v_node_val + 6),
-                    ("^", v_val + 7, v_val + 7, v_node_val + 7),
-                ]
-            })
+                # Cycle 1: compute addresses for elements 0,1
+                self.add_bundle({"alu": [
+                    ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 0),
+                    ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 1),
+                ]})
+                # Cycle 2: load[0,1] + addr[2,3]
+                self.add_bundle({
+                    "load": [
+                        ("load", v_node_val + 0, tmp[2]),
+                        ("load", v_node_val + 1, tmp[3]),
+                    ],
+                    "alu": [
+                        ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 2),
+                        ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 3),
+                    ]
+                })
+                # Cycle 3: load[2,3] + addr[4,5] + XOR[0,1]
+                self.add_bundle({
+                    "load": [
+                        ("load", v_node_val + 2, tmp[2]),
+                        ("load", v_node_val + 3, tmp[3]),
+                    ],
+                    "alu": [
+                        ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 4),
+                        ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 5),
+                        ("^", v_val + 0, v_val + 0, v_node_val + 0),
+                        ("^", v_val + 1, v_val + 1, v_node_val + 1),
+                    ]
+                })
+                # Cycle 4: load[4,5] + addr[6,7] + XOR[2,3]
+                self.add_bundle({
+                    "load": [
+                        ("load", v_node_val + 4, tmp[2]),
+                        ("load", v_node_val + 5, tmp[3]),
+                    ],
+                    "alu": [
+                        ("+", tmp[2], self.scratch["forest_values_p"], v_idx + 6),
+                        ("+", tmp[3], self.scratch["forest_values_p"], v_idx + 7),
+                        ("^", v_val + 2, v_val + 2, v_node_val + 2),
+                        ("^", v_val + 3, v_val + 3, v_node_val + 3),
+                    ]
+                })
+                # Cycle 5: load[6,7] + XOR[4,5]
+                self.add_bundle({
+                    "load": [
+                        ("load", v_node_val + 6, tmp[2]),
+                        ("load", v_node_val + 7, tmp[3]),
+                    ],
+                    "alu": [
+                        ("^", v_val + 4, v_val + 4, v_node_val + 4),
+                        ("^", v_val + 5, v_val + 5, v_node_val + 5),
+                    ]
+                })
+                # Cycle 6: XOR[6,7] - must wait for load to complete
+                self.add_bundle({
+                    "alu": [
+                        ("^", v_val + 6, v_val + 6, v_node_val + 6),
+                        ("^", v_val + 7, v_val + 7, v_node_val + 7),
+                    ]
+                })
 
             # Use multiply_add for stages 0, 2, 4 (saves 1 cycle each)
             # Stage 0: ("+", c1, "+", "<<", 12) → val*4097 + c1
