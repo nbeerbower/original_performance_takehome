@@ -103,7 +103,8 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        addr_temps = [self.alloc_scratch() for _ in range(2)]
+        # Use 7 temp addresses to batch-load all header values in 2 cycles
+        addr_temps = [self.alloc_scratch() for _ in range(len(init_vars))]
 
         # Scalar constants - allocate addresses only
         scalar_consts = {}  # value -> address
@@ -151,17 +152,15 @@ class KernelBuilder:
         # PHASE 2: BATCHED CONSTANT LOADING (minimal cycles)
         # =========================================================
 
-        # Load header: const addresses + load values in batched cycles
-        # Cycle pattern: const addr, load from addr (each pair)
-        for i in range(0, len(init_vars), 2):
-            bundle = {"load": []}
-            for j in range(min(2, len(init_vars) - i)):
-                bundle["load"].append(("const", addr_temps[j], i + j))
-            self.add_bundle(bundle)
-            bundle = {"load": []}
-            for j in range(min(2, len(init_vars) - i)):
-                bundle["load"].append(("load", self.scratch[init_vars[i + j]], addr_temps[j]))
-            self.add_bundle(bundle)
+        # Load header: batch all const addresses, then batch all loads (2 cycles total)
+        # Cycle 1: const 0,1,2,3,4,5,6 into temp addresses
+        self.add_bundle({
+            "load": [("const", addr_temps[i], i) for i in range(len(init_vars))]
+        })
+        # Cycle 2: load all init_vars from their addresses
+        self.add_bundle({
+            "load": [("load", self.scratch[init_vars[i]], addr_temps[i]) for i in range(len(init_vars))]
+        })
 
         # Load ALL scalar constants in batches of 64 (max load slots)
         const_list = list(scalar_consts.items())  # [(value, addr), ...]
