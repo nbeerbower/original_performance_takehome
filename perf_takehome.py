@@ -241,14 +241,10 @@ class KernelBuilder:
 
         round_loop_start = len(self.instrs)
 
-        # === LOAD PHASE: Load all 32 val vectors (1 cycle with 32 load slots) ===
+        # === LOAD VAL + GATHER + idx*2 (1 cycle with 64 load slots + 32 VALU slots) ===
         self.add_bundle({
-            "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)],
-        })
-
-        # === GATHER + idx*2 (1 cycle with 32 load slots + 32 VALU slots) ===
-        self.add_bundle({
-            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
+            "load": [("vload", v_val[i], val_base[i]) for i in range(UNROLL)] +
+                    [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
             "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
         })
 
