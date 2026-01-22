@@ -202,24 +202,13 @@ class KernelBuilder:
                     cache_load_ops,
         })
 
-        round_loop_start = len(self.instrs)
-
-        # === 2-CYCLE ROUND LOOP ===
-        # Cycle A: gather + idx*2 + compare
-        # Val stays in scratch - no memory load needed!
-        self.add_bundle({
-            "load": [("scratch_gather", v_node_val[i], v_idx[i], tree_cache, CACHE_SIZE) for i in range(UNROLL)],
-            "valu": [("*", v_idx[i], v_idx[i], v_two) for i in range(UNROLL)],
-            "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])],
-        })
-
-        # Cycle B: hash + increment + cond_jump
-        # Compare wrote loop_cond at end of cycle A, available now
-        self.add_bundle({
-            "valu": [("hash_and_tree_step", v_idx[i], v_val[i], v_idx[i], v_val[i], v_node_val[i], v_n_nodes) for i in range(UNROLL)],
-            "flow": [("add_imm", round_counter, round_counter, 1),
-                     ("cond_jump", loop_cond, round_loop_start)],
-        })
+        # === FULLY UNROLLED ROUNDS ===
+        # With 16 fixed rounds, unroll completely to avoid loop overhead
+        # Each round is 1 cycle with gather_hash_step
+        for round_num in range(rounds):
+            self.add_bundle({
+                "valu": [("gather_hash_step", v_idx[i], v_val[i], v_idx[i], v_val[i], tree_cache, CACHE_SIZE, v_n_nodes) for i in range(UNROLL)],
+            })
 
         # === STORE VAL ONCE AT END ===
         # Only store final values to memory after all rounds complete

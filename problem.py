@@ -369,6 +369,41 @@ class Machine:
                     # Write both outputs
                     self.scratch_write[dest_val + i] = a
                     self.scratch_write[dest_idx + i] = new_index if new_index < n else 0
+            case ("gather_hash_step", dest_idx, dest_val, idx, val, cache_base, cache_size, n_nodes):
+                # Ultimate combined instruction: gather + idx*2 + hash + tree_step
+                # Does gather INTERNALLY (not via scratch_write) to avoid 1-cycle dependency
+                # 1. node_val = gather(cache_base, idx)  (internal, not written to scratch)
+                # 2. new_val = myhash(val ^ node_val)
+                # 3. new_idx = ((idx*2) + 1 + (new_val & 1)) if in_bounds else 0
+                for i in range(VLEN):
+                    # Gather phase (INTERNAL - read directly, don't use scratch_write)
+                    tree_idx = core.scratch[idx + i]
+                    clamped_idx = min(tree_idx, cache_size - 1)
+                    node_val = core.scratch[cache_base + clamped_idx]  # Direct read
+
+                    # Hash phase (using gathered value immediately)
+                    a = core.scratch[val + i] ^ node_val
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        if op1 == "+":
+                            t1 = (a + val1) % (2**32)
+                        else:
+                            t1 = a ^ val1
+                        if op3 == "<<":
+                            t2 = (a << val3) % (2**32)
+                        else:
+                            t2 = a >> val3
+                        if op2 == "+":
+                            a = (t1 + t2) % (2**32)
+                        else:
+                            a = t1 ^ t2
+
+                    # Tree step phase with idx*2 built-in
+                    new_tree_idx = tree_idx * 2 + 1 + (a & 1)
+                    n = core.scratch[n_nodes + i]
+
+                    # Write outputs
+                    self.scratch_write[dest_val + i] = a
+                    self.scratch_write[dest_idx + i] = new_tree_idx if new_tree_idx < n else 0
             case (op, dest, a1, a2):
                 for i in range(VLEN):
                     self.alu(core, op, dest + i, a1 + i, a2 + i)
