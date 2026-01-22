@@ -227,21 +227,19 @@ class KernelBuilder:
         for round_num in range(rounds):
             # OPTIMIZATION: Round 0 has all idx=0 (all start at root)
             # Just load tree.values[0] once and broadcast - saves ~4 cycles per chunk
-            if round_num == 0:
-                # Load root node value directly (all idx are 0)
+            if round_num == 0 or round_num == 11:
+                # Round 0/11: all idx=0 (round 11 after wrap from level 10)
+                # Load root node value directly
                 self.add_bundle({"load": [("load", tmp[4], self.scratch["forest_values_p"])]})
-                # Broadcast to all 8 positions
                 self.add_bundle({"valu": [("vbroadcast", v_node_val, tmp[4])]})
-                # Vector XOR
                 self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
-            elif round_num == 1:
-                # Round 1: all idx are 1 or 2 (children of root, pre-cached)
-                # cond = (idx == 1), then select from cached tree[1] or tree[2]
-                self.add_bundle({"valu": [("==", v_tmp1, v_idx, v_one)]})  # cond: 1 if idx==1, 0 if idx==2
+            elif round_num == 1 or round_num == 12:
+                # Round 1/12: all idx are 1 or 2 (children of root, pre-cached)
+                self.add_bundle({"valu": [("==", v_tmp1, v_idx, v_one)]})
                 self.add_bundle({"flow": [("vselect", v_node_val, v_tmp1, v_tree1, v_tree2)]})
                 self.add_bundle({"valu": [("^", v_val, v_val, v_node_val)]})
-            elif round_num == 2:
-                # Round 2: all idx are 3, 4, 5, or 6 (pre-cached)
+            elif round_num == 2 or round_num == 13:
+                # Round 2/13: all idx are 3, 4, 5, or 6 (pre-cached)
                 # Two-level selection: first by (idx < 5), then by (idx & 1)
                 self.add_bundle({"valu": [
                     ("&", v_tmp1, v_idx, v_one),  # odd_cond: idx & 1
