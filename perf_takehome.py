@@ -347,15 +347,18 @@ class KernelBuilder:
 
             # Tree step: idx = idx*2 + 1 + (val & 1), with bounds check
             # Use multiply_add: idx*2 + 1 in one cycle
-            # For last round, overlap store address calc with tree step (alu free during valu)
+            # OPTIMIZATION: Only round 10 needs bounds check (level 10 → wrap to 0)
+            # For last round, overlap store address calc with tree step
+            needs_bounds_check = (round_num == 10)
+
             if round_num == rounds - 1:
-                # Last round - overlap store address calc
+                # Last round - overlap store address calc, no bounds check needed
                 self.add_bundle({
                     "valu": [
                         ("multiply_add", v_idx, v_idx, v_two, v_one),
                         ("&", v_tmp1, v_val, v_one),
                     ],
-                    "alu": [("*", tmp[0], chunk_i, vlen_c)]  # Start store addr calc
+                    "alu": [("*", tmp[0], chunk_i, vlen_c)]
                 })
                 self.add_bundle({
                     "valu": [("+", v_idx, v_idx, v_tmp1)],
@@ -364,9 +367,9 @@ class KernelBuilder:
                         ("+", tmp[1], self.scratch["inp_values_p"], tmp[0]),
                     ]
                 })
-                self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
-                self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
-            else:
+                # No bounds check for round 15 (indices 31-62, well below n_nodes)
+            elif needs_bounds_check:
+                # Round 10: must do bounds check (level 10 children >= n_nodes)
                 self.add_bundle({"valu": [
                     ("multiply_add", v_idx, v_idx, v_two, v_one),
                     ("&", v_tmp1, v_val, v_one),
@@ -374,6 +377,13 @@ class KernelBuilder:
                 self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})
                 self.add_bundle({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
                 self.add_bundle({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
+            else:
+                # Other rounds: no bounds check needed (all idx < n_nodes)
+                self.add_bundle({"valu": [
+                    ("multiply_add", v_idx, v_idx, v_two, v_one),
+                    ("&", v_tmp1, v_val, v_one),
+                ]})
+                self.add_bundle({"valu": [("+", v_idx, v_idx, v_tmp1)]})
 
         # Store results + increment chunk_i in parallel (store + flow engines)
         self.add_bundle({
@@ -400,7 +410,7 @@ BASELINE = 147734
 
 def do_kernel_test(
     forest_height: int, rounds: int, batch_size: int,
-    seed: int = 123, trace: bool = False, prints: bool = False,
+    seed: int = 123, trace: bool = False,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -411,9 +421,9 @@ def do_kernel_test(
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
 
-    machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES, trace=trace, prints=prints)
+    machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES, trace=trace)
 
-    for expected in reference_kernel2(mem, forest.height, len(inp.values), rounds):
+    for expected in reference_kernel2(mem):
         machine.run()
         inp_values_p = mem[6]
         assert machine.mem[inp_values_p:inp_values_p + len(inp.values)] == expected[inp_values_p:inp_values_p + len(inp.values)], f"Incorrect values"
